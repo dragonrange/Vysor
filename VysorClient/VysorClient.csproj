@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>VysorClient</RootNamespace>
+    <AssemblyName>Vysor</AssemblyName>
+    <Product>Vysor</Product>
+    <AssemblyTitle>Vysor</AssemblyTitle>
+    <UseWindowsForms>true</UseWindowsForms>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+
+    <!-- Ícone do ARQUIVO .exe: é o que aparece no Explorer, no atalho e na
+         barra de tarefas. Isso NÃO cobre o ícone da janela — pra esse, o
+         arquivo precisa ir junto como recurso (ItemGroup abaixo) e ser
+         apontado no Icon= da janela, em MainWindow.xaml. São dois lugares
+         diferentes; mexer só num deles deixa o outro sem ícone. -->
+    <ApplicationIcon>vysor.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Empacota o ícone DENTRO do programa, pra janela conseguir usá-lo
+         enquanto roda. Sem esta linha, o Icon="vysor.ico" do XAML não acha o
+         arquivo e a janela fica sem ícone. -->
+    <Resource Include="vysor.ico" />
+  </ItemGroup>
+
+  <!-- O Vysor agora HOSPEDA a sala no próprio PC (ver Services/LocalServer.cs)
+       em vez de depender de um servidor alugado na internet. Pra isso ele
+       precisa das peças de servidor do ASP.NET Core. Como o app é publicado
+       "self-contained" (o .NET vai dentro do .exe), elas são empacotadas
+       junto: ninguém precisa instalar nada a mais, o .exe só cresce um
+       pouco. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- Os três arquivos abaixo são COMPARTILHADOS com o projeto VysorServer:
+       são os MESMOS arquivos, não cópias. É de propósito. Toda a lógica de
+       sala já acertada em uso real (tolerância a queda de conexão, limite de
+       fila de envio, reentrada automática) vale igual aqui dentro do app.
+       Duplicar o código significaria corrigir cada bug duas vezes — e um dia
+       esquecer de um dos lados. -->
+  <ItemGroup>
+    <Compile Include="..\VysorServer\Hubs\RoomHub.cs" Link="Servidor\RoomHub.cs" />
+    <Compile Include="..\VysorServer\RoomManager.cs" Link="Servidor\RoomManager.cs" />
+    <Compile Include="..\VysorServer\RoomSweeper.cs" Link="Servidor\RoomSweeper.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="8.0.*" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.11" />
+    <!-- Usada para captura/reprodução de áudio real (loopback do sistema e,
+         quando possível, isolado por processo) e para mixagem por participante
+         com controle individual de volume. -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>

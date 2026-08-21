@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: vysorserver
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerfilePath: ./VysorServer/Dockerfile
+    dockerContext: ./VysorServer
+    healthCheckPath: /status
+    autoDeployTrigger: commit

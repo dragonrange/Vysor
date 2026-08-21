@@ -1,0 +1,816 @@
+<Window x:Class="VysorClient.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        xmlns:local="clr-namespace:VysorClient"
+        Title="Vysor" Icon="vysor.ico"
+        Height="680" Width="1040" MinHeight="520" MinWidth="800"
+        WindowStyle="None" AllowsTransparency="False" ResizeMode="CanResize" Background="#121214">
+
+    <!-- WindowChrome devolve o redimensionamento pelas bordas (e o "snap" do
+         Windows) mesmo com WindowStyle="None" — sem ele, uma janela sem
+         moldura nativa não responde a arrastar as bordas pra redimensionar. -->
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="0"
+                             ResizeBorderThickness="6"
+                             GlassFrameThickness="0"
+                             UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <local:NullToVisibilityConverter x:Key="NullToVisibilityConverter"/>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter"/>
+
+        <!-- Estilo padrão de botão para o app inteiro: cantos arredondados, feedback de hover/pressed. -->
+        <Style TargetType="Button">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <!-- Texto branco por padrão. O padrão do WPF é PRETO, e como todos
+                 os fundos deste app são escuros, qualquer botão que esquecesse
+                 de definir a cor do texto ficava preto no preto — literalmente
+                 invisível. Era o que acontecia com os botões de fixar (📌) e
+                 fechar (✕) no canto superior das telinhas: eles estavam lá e
+                 funcionavam, mas não dava pra ver nada. -->
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8"
+                                SnapsToDevicePixels="True">
+                            <ContentPresenter Margin="{TemplateBinding Padding}"
+                                               HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                               VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                               RecognizesAccessKey="True"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.85"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.7"/>
+                            </Trigger>
+                            <!-- Botão desligado: bem apagado e sem a mãozinha do
+                                 mouse, pra ficar evidente que ele ainda não pode
+                                 ser clicado (é assim que a tela inicial mostra que
+                                 falta preencher o nome). -->
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.25"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Botão circular pequeno usado nos overlays dos tiles (pin, fechar, mudo):
+             fundo semi-transparente e borda colorida controlável via binding. -->
+        <Style x:Key="TileIconButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Width" Value="28"/>
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Background" Value="#B3000000"/>
+            <Setter Property="BorderThickness" Value="1.5"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+        </Style>
+
+        <!-- Botão de fechar do modal: maior e com presença, em vez do "x"
+             discreto de antes. Fica cinza parado e vermelho ao passar o mouse,
+             que é a convenção que todo mundo já reconhece. -->
+        <Style x:Key="CloseModalButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Width" Value="34"/>
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="FontSize" Value="16"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Background" Value="#2D2D36"/>
+            <Setter Property="Foreground" Value="#B9BBBE"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                CornerRadius="17" SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#F23F42"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#C82D30"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Barra de volume no estilo do Discord: trilho fino e arredondado, a
+             parte já percorrida em destaque, e uma bolinha branca que cresce
+             quando o mouse chega perto. Sem isto, o WPF desenha o controle
+             padrão do Windows, que destoa completamente do resto. -->
+        <Style TargetType="Thumb" x:Key="VolumeThumbStyle">
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Grid>
+                            <Ellipse x:Name="Knob" Width="12" Height="12" Fill="White"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Knob" Property="Width" Value="15"/>
+                                <Setter TargetName="Knob" Property="Height" Value="15"/>
+                            </Trigger>
+                            <Trigger Property="IsDragging" Value="True">
+                                <Setter TargetName="Knob" Property="Width" Value="15"/>
+                                <Setter TargetName="Knob" Property="Height" Value="15"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Os dois "lados" do trilho são botões invisíveis que também permitem
+             clicar direto num ponto da barra pra pular pra ele. -->
+        <Style TargetType="RepeatButton" x:Key="VolumeTrackStyle">
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="IsTabStop" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RepeatButton">
+                        <Border Background="Transparent"/>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="Slider" x:Key="VolumeSliderStyle">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="IsMoveToPointEnabled" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Slider">
+                        <Grid Height="18" VerticalAlignment="Center">
+                            <!-- trilho de fundo (a parte ainda não percorrida) -->
+                            <Border Height="5" CornerRadius="3" Background="#4E5058" VerticalAlignment="Center"/>
+
+                            <Track x:Name="PART_Track">
+                                <!-- O lado ESQUERDO do trilho é quem desenha a parte
+                                     preenchida. Fazer assim (em vez de uma barra
+                                     separada com largura calculada) garante que o
+                                     preenchimento acompanhe a bolinha exatamente,
+                                     sem sobra nem folga. -->
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Command="Slider.DecreaseLarge" Focusable="False" IsTabStop="False">
+                                        <RepeatButton.Template>
+                                            <ControlTemplate TargetType="RepeatButton">
+                                                <Grid Background="Transparent">
+                                                    <Border Height="5" CornerRadius="3" Background="White" VerticalAlignment="Center"/>
+                                                </Grid>
+                                            </ControlTemplate>
+                                        </RepeatButton.Template>
+                                    </RepeatButton>
+                                </Track.DecreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Style="{StaticResource VolumeThumbStyle}"/>
+                                </Track.Thumb>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource VolumeTrackStyle}" Command="Slider.IncreaseLarge"/>
+                                </Track.IncreaseRepeatButton>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Barra de rolagem fina e escura, no lugar da barra cinza padrão do
+             Windows (que aparecia com setinhas e destoava de tudo). -->
+        <Style TargetType="ScrollBar">
+            <Setter Property="Width" Value="8"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ScrollBar">
+                        <Grid Background="Transparent">
+                            <Border CornerRadius="4" Background="#1A000000" Margin="2,0"/>
+                            <Track x:Name="PART_Track" IsDirectionReversed="True">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource VolumeTrackStyle}" Command="ScrollBar.PageUpCommand"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb>
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="Thumb">
+                                                <Border x:Name="Bar" CornerRadius="4" Background="#5C5F66" Margin="2,0"/>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="Bar" Property="Background" Value="#7A7D85"/>
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Style="{StaticResource VolumeTrackStyle}" Command="ScrollBar.PageDownCommand"/>
+                                </Track.IncreaseRepeatButton>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="Orientation" Value="Horizontal">
+                    <Setter Property="Width" Value="Auto"/>
+                    <Setter Property="Height" Value="8"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Cartão de miniatura no seletor de fonte (estilo Discord: imagem + nome, com anel ao selecionar). -->
+        <Style x:Key="SourceCardStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#27272A"/>
+            <Setter Property="BorderBrush" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="2"/>
+            <Setter Property="Margin" Value="6"/>
+            <Setter Property="Padding" Value="6"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                    <Setter Property="BorderBrush" Value="#5865F2"/>
+                    <Setter Property="Background" Value="#2B2D5C"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <!-- Estilo das abas "Tela Inteira" / "Janelas" no modal de compartilhamento.
+             Sem isso o TabControl renderiza com o visual padrão (cinza, quadrado) do
+             Windows, destoando completamente do resto da UI escura e arredondada. -->
+        <Style TargetType="TabItem">
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="Bd" CornerRadius="8" Margin="0,0,8,0" Padding="16,8"
+                                Background="#27272A">
+                            <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="#A1A1AA"/>
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#5865F2"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.85"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Foreground" Value="White"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="TabControl">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabControl">
+                        <DockPanel>
+                            <TabPanel DockPanel.Dock="Top" IsItemsHost="True" Margin="0,0,0,10"/>
+                            <ContentPresenter ContentSource="SelectedContent"/>
+                        </DockPanel>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <DataTemplate x:Key="SourceCardTemplate">
+            <Button Style="{StaticResource SourceCardStyle}" Click="SourceCard_Click" Width="152" Height="112">
+                <StackPanel>
+                    <Border CornerRadius="6" Background="#000000" Width="136" Height="76" ClipToBounds="True">
+                        <Grid>
+                            <Image Source="{Binding Thumbnail}" Stretch="UniformToFill"/>
+                            <TextBlock Text="⏳" FontSize="18" Foreground="#4B5563"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Visibility="{Binding Thumbnail, Converter={StaticResource NullToVisibilityConverter}}"/>
+                        </Grid>
+                    </Border>
+                    <TextBlock Text="{Binding Name}" Foreground="White" FontSize="11"
+                               TextTrimming="CharacterEllipsis" TextAlignment="Center"
+                               Width="136" Margin="0,6,0,0"/>
+                </StackPanel>
+            </Button>
+        </DataTemplate>
+
+        <!-- Estilo padrão de campo de texto, arredondado como o resto do app. -->
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#27272A"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="CaretBrush" Value="White"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="10,0"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="8" SnapsToDevicePixels="True">
+                            <Grid>
+                                <!-- Texto de dica (cinza), que some assim que a pessoa
+                                     digita qualquer coisa. Vem do "Tag" de cada campo.
+                                     Antes, os campos usavam Tag mas o modelo visual
+                                     ignorava esse valor, então a dica nunca aparecia —
+                                     e o campo de nome vinha PREENCHIDO com "Usuário",
+                                     obrigando a apagar antes de escrever o nome de
+                                     verdade. Dica não é conteúdo: não precisa apagar. -->
+                                <TextBlock x:Name="Placeholder"
+                                           Text="{TemplateBinding Tag}"
+                                           Foreground="#6B7280"
+                                           Margin="{TemplateBinding Padding}"
+                                           VerticalAlignment="Center"
+                                           IsHitTestVisible="False"
+                                           Visibility="Collapsed"/>
+                                <ScrollViewer x:Name="PART_ContentHost"
+                                              Margin="{TemplateBinding Padding}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="Text" Value="">
+                                <Setter TargetName="Placeholder" Property="Visibility" Value="Visible"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Estilo padrão de ComboBox (usado nos seletores de qualidade da stream),
+             consistente com o resto do app em vez do visual nativo do Windows. -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="#27272A"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="10,6"/>
+            <Style.Triggers>
+                <Trigger Property="IsHighlighted" Value="True">
+                    <Setter Property="Background" Value="#5865F2"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#27272A"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="10,0"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton x:Name="Toggle"
+                                          Background="{TemplateBinding Background}"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Focusable="False" ClickMode="Press">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{TemplateBinding Background}" CornerRadius="8">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <ContentPresenter Grid.Column="0"
+                                                                   Margin="{TemplateBinding Padding}"
+                                                                   VerticalAlignment="Center"
+                                                                   Content="{TemplateBinding Content}"/>
+                                                <TextBlock Grid.Column="1" Text="▾" Foreground="#A1A1AA" Margin="0,0,10,0" VerticalAlignment="Center"/>
+                                            </Grid>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter x:Name="ContentSite" IsHitTestVisible="False"
+                                               Content="{TemplateBinding SelectionBoxItem}"
+                                               Margin="{TemplateBinding Padding}"
+                                               VerticalAlignment="Center" HorizontalAlignment="Left"/>
+                            <Popup x:Name="Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                                <Border Background="#27272A" CornerRadius="8" Padding="4"
+                                        MinWidth="{TemplateBinding ActualWidth}" MaxHeight="200">
+                                    <ScrollViewer SnapsToDevicePixels="True">
+                                        <StackPanel IsItemsHost="True"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Toggle switch "pill" (estilo iOS/Discord), usado no lugar do CheckBox
+             padrão do Windows para "Transmitir com Som" / "Transmitir Som da Janela". -->
+        <Style x:Key="ToggleSwitchStyle" TargetType="CheckBox">
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="42"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid Width="42" Height="24">
+                                <Border x:Name="Track" CornerRadius="12" Background="#3A3A40"/>
+                                <Border x:Name="Knob" Width="18" Height="18" CornerRadius="9" Background="White"
+                                        HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                            </Grid>
+                            <ContentPresenter Grid.Column="1" Margin="10,0,0,0"
+                                               VerticalAlignment="Center" Content="{TemplateBinding Content}"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Track" Property="Background" Value="#23A55A"/>
+                                <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right"/>
+                                <Setter TargetName="Knob" Property="Margin" Value="0,0,3,0"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <!-- Conteúdo Principal (o menu lateral com "Início" foi removido —
+             ficava sobrando espaço sem fazer muita falta. A marca
+             "⚡ Vysor" continua no canto, mas agora fixada com alinhamento
+             de verdade em vez de uma margem "mágica" calculada pro tamanho
+             específico da janela no momento em que foi editada — do jeito
+             que estava, ela ficava presa dentro da coluna de 0px que sobrou
+             do menu removido, e quebraria assim que a janela fosse
+             redimensionada.) -->
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="35"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <!-- Barra Superior Customizada -->
+            <Border Grid.Row="0" Background="#18181B" MouseLeftButtonDown="Header_MouseLeftButtonDown">
+                <DockPanel HorizontalAlignment="Right" Margin="0,0,10,0">
+                    <Button Content="—" Click="BtnMinimize_Click" Width="30" Height="25" Background="Transparent" Foreground="White"/>
+                    <Button Content="☐" Click="BtnMaximize_Click" Width="30" Height="25" Background="Transparent" Foreground="White"/>
+                    <Button Content="✕" Click="BtnClose_Click" Width="30" Height="25" Background="Transparent" Foreground="#F23F42"/>
+                </DockPanel>
+            </Border>
+
+            <!-- Tela 1: Lobby -->
+            <Grid x:Name="ViewLobby" Grid.Row="1" Visibility="Visible" Margin="30">
+                <StackPanel Width="360" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Text="Nome" Foreground="#A1A1AA" Margin="0,0,0,5"/>
+                    <TextBox x:Name="TxtDisplayName" Tag="Digite seu nome" TextChanged="TxtDisplayName_TextChanged" Height="38" Margin="0,0,0,6"/>
+
+                    <!-- Aviso que só aparece enquanto o nome está vazio, explicando
+                         por que os botões abaixo estão apagados. -->
+                    <TextBlock x:Name="TxtNameHint" Text="Escolha um nome para seus amigos te reconhecerem na sala."
+                               Foreground="#8A8A93" FontSize="11" TextWrapping="Wrap" Margin="2,0,0,14"/>
+
+                    <Button x:Name="BtnCreateRoom" Content="➕ Criar Sala" Click="BtnCreateRoom_Click" IsEnabled="False" Height="42" Background="#5865F2" Foreground="White" FontWeight="Bold" Margin="0,0,0,24"/>
+
+                    <Border Height="1" Background="#27272A" Margin="0,0,0,24"/>
+
+                    <TextBlock Text="Código da Sala" Foreground="#A1A1AA" Margin="0,0,0,5"/>
+                    <Grid Margin="0,0,0,20">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="TxtRoomCode" Tag="Ex: XJ4K9P" TextChanged="TxtRoomCode_TextChanged" Height="38"/>
+                        <Button x:Name="BtnJoinRoom" Grid.Column="1" Content="Entrar com Código" Click="BtnJoinRoom_Click" IsEnabled="False" Width="150" Height="38" Background="#23A55A" Foreground="White" FontWeight="Bold" Margin="10,0,0,0"/>
+                    </Grid>
+
+                    <TextBlock Text="Salas Recentes" Foreground="#A1A1AA" Margin="0,0,0,5"/>
+                    <ListBox x:Name="ListRecentRooms" SelectionChanged="ListRecentRooms_SelectionChanged" Height="80" Background="#27272A" Foreground="White" BorderThickness="0" Margin="0,0,0,18"/>
+
+                    <!-- Diagnóstico de conexão.
+                         Existe porque a pergunta "meus amigos conseguem me
+                         alcançar?" não tinha resposta dentro do app: a pessoa
+                         só descobria que não quando o amigo tentava entrar e
+                         recebia um erro que não explicava nada. -->
+                    <Border Height="1" Background="#27272A" Margin="0,0,0,16"/>
+                    <Button x:Name="BtnTestConnection" Content="🔍 Testar minha conexão"
+                            Click="BtnTestConnection_Click" Height="34"
+                            Background="#2D2D36" Foreground="White"/>
+                    <TextBlock x:Name="TxtConnectionResult" Text="" Foreground="#A1A1AA"
+                               FontSize="11" TextWrapping="Wrap" Margin="2,8,0,0"/>
+                </StackPanel>
+            </Grid>
+
+            <!-- Tela 2: Dentro da Sala -->
+            <Grid x:Name="ViewRoom" Grid.Row="1" Visibility="Collapsed" Margin="15">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- Topo da Sala: código+copiar no canto superior esquerdo, sair no superior direito -->
+                <DockPanel Grid.Row="0" Margin="0,0,0,12">
+                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
+                        <TextBlock Text="CÓDIGO DA SALA: " Foreground="#8A8A93" FontWeight="Bold" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="TxtActiveCode" Text="------" Foreground="#5865F2" FontWeight="Bold" FontSize="16" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                        <Button Content="📋 Copiar" Click="BtnCopyCode_Click" Height="30" Padding="10,0" Background="#2D2D36" Foreground="White"/>
+                    </StackPanel>
+
+                    <Button Content="🚪 Sair da Sala" Click="BtnLeaveRoom_Click" DockPanel.Dock="Right" Height="30" Padding="12,0" Background="#F23F42" Foreground="White" FontWeight="Bold"/>
+                </DockPanel>
+
+                <!-- Centro: espaço de transmissões (esquerda/centro) + participantes (direita) -->
+                <Grid Grid.Row="1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="200"/>
+                    </Grid.ColumnDefinitions>
+
+                    <Border Grid.Column="0" Background="#141419" CornerRadius="10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+
+                            <Grid Grid.Row="0">
+                                <ItemsControl x:Name="StreamsGrid">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <UniformGrid Rows="1" Columns="1"/>
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <!-- A visibilidade precisa estar na "caixinha" que o
+                                         ItemsControl cria em volta de cada item, e não só no
+                                         conteúdo dela: o UniformGrid conta as caixinhas pra
+                                         distribuir as células. Antes, esconder um tile deixava
+                                         a caixinha vazia ocupando lugar, então fixar (pin) um
+                                         tile que não fosse o primeiro empurrava o tile fixado
+                                         pra fora da área visível e a tela ficava toda preta. -->
+                                    <ItemsControl.ItemContainerStyle>
+                                        <Style TargetType="ContentPresenter">
+                                            <Setter Property="Visibility" Value="{Binding TileVisibility}"/>
+                                        </Style>
+                                    </ItemsControl.ItemContainerStyle>
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border x:Name="TileRoot" Margin="4" CornerRadius="10" Background="#0D0D10"
+                                                ClipToBounds="True" Visibility="{Binding TileVisibility}">
+                                                <Grid>
+                                                    <Image Source="{Binding Image}" Stretch="Uniform"/>
+
+                                                    <TextBlock Text="Aguardando o primeiro quadro..." Foreground="#6B7280" FontSize="13"
+                                                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                           Visibility="{Binding Image, Converter={StaticResource NullToVisibilityConverter}}"/>
+
+                                                    <!-- Overlay que só aparece com o mouse em cima do tile -->
+                                                    <Grid x:Name="HoverOverlay" Opacity="0">
+                                                        <Grid.RowDefinitions>
+                                                            <RowDefinition Height="Auto"/>
+                                                            <RowDefinition Height="*"/>
+                                                            <RowDefinition Height="Auto"/>
+                                                        </Grid.RowDefinitions>
+
+                                                        <!-- Linha de cima: nome (esquerda) + pin/fechar (direita) -->
+                                                        <DockPanel Grid.Row="0" Margin="10" LastChildFill="False">
+                                                            <Border DockPanel.Dock="Left" Background="#B3000000" CornerRadius="6" Padding="8,4">
+                                                                <TextBlock Text="{Binding DisplayName}" Foreground="White" FontSize="12" FontWeight="Bold"/>
+                                                            </Border>
+
+                                                            <Button DockPanel.Dock="Right" Style="{StaticResource TileIconButtonStyle}"
+                                                                Content="✕" Click="BtnCloseTile_Click" Margin="6,0,0,0"/>
+                                                            <Button DockPanel.Dock="Right" Style="{StaticResource TileIconButtonStyle}"
+                                                                Content="📌" Click="BtnPinTile_Click"
+                                                                BorderBrush="{Binding PinBorderColor}"/>
+                                                        </DockPanel>
+
+                                                        <!-- Linha de baixo: volume (esquerda) + botão de mudo (direita) -->
+                                                        <Grid Grid.Row="2" Margin="10" Visibility="{Binding ShowAudioControls, Converter={StaticResource BoolToVisibilityConverter}}">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="*"/>
+                                                                <ColumnDefinition Width="Auto"/>
+                                                            </Grid.ColumnDefinitions>
+
+                                                            <Border Grid.Column="0" Background="#B3000000" CornerRadius="8" Padding="10,8" HorizontalAlignment="Left">
+                                                                <StackPanel Orientation="Horizontal">
+                                                                    <Slider Minimum="0" Maximum="150" Value="{Binding Volume, Mode=TwoWay}"
+                                                                        Style="{StaticResource VolumeSliderStyle}"
+                                                                        Width="120" VerticalAlignment="Center"/>
+                                                                    <TextBlock Text="{Binding Volume, StringFormat={}{0:0}%}" Foreground="White"
+                                                                           VerticalAlignment="Center" Width="38" Margin="8,0,0,0"/>
+                                                                </StackPanel>
+                                                            </Border>
+
+                                                            <Button Grid.Column="1" Style="{StaticResource TileIconButtonStyle}"
+                                                                Width="34" Height="34" HorizontalAlignment="Right"
+                                                                Click="BtnToggleMute_Click"
+                                                                Content="{Binding SpeakerIcon}" Foreground="White"
+                                                                BorderBrush="{Binding SpeakerBorderColor}" BorderThickness="2"/>
+                                                        </Grid>
+                                                    </Grid>
+                                                </Grid>
+                                            </Border>
+                                            <DataTemplate.Triggers>
+                                                <Trigger SourceName="TileRoot" Property="IsMouseOver" Value="True">
+                                                    <Setter TargetName="HoverOverlay" Property="Opacity" Value="1"/>
+                                                </Trigger>
+                                            </DataTemplate.Triggers>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+
+                                <StackPanel x:Name="EmptyStatePanel" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock x:Name="StreamPlaceholderText" Text="Aguardando transmissão de tela..." Foreground="#6B7280" FontSize="14" HorizontalAlignment="Center"/>
+                                    <TextBlock Text="Clique no play ao lado de um participante pra assistir (você pode ver vários ao mesmo tempo)" Foreground="#4B5563" FontSize="11" HorizontalAlignment="Center" Margin="0,6,0,0" TextWrapping="Wrap" MaxWidth="260" TextAlignment="Center"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Faixa própria pro botão "Transmitir", abaixo do grid de transmissões
+                             (antes ficava flutuando por cima dos tiles e escondia os controles
+                             de volume/mudo da última fileira). -->
+                            <Border Grid.Row="1" Background="#18181B" CornerRadius="0,0,10,10" Padding="0,10,0,14">
+                                <StackPanel>
+                                    <!-- Recado curto e discreto (ex: "a janela foi fechada"),
+                                         no lugar de uma caixa de diálogo que interrompe. Fica
+                                         escondido até ter algo a dizer. -->
+                                    <TextBlock x:Name="TxtStreamNotice" Visibility="Collapsed"
+                                               Foreground="#FAA61A" FontSize="12" TextWrapping="Wrap"
+                                               TextAlignment="Center" Margin="20,0,20,10"/>
+
+                                    <Button x:Name="BtnShareScreen" Content="🖥️ TRANSMITIR" Click="BtnShareScreen_Click"
+                                        HorizontalAlignment="Center"
+                                        Height="42" MinWidth="200" Padding="20,0"
+                                        Background="#5865F2" Foreground="White" FontWeight="Bold" FontSize="14"/>
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <!-- Painel Lateral de Participantes -->
+                    <Border Grid.Column="1" Background="#1E1E24" CornerRadius="10" Margin="10,0,0,0" Padding="8">
+                        <DockPanel>
+                            <TextBlock DockPanel.Dock="Top" Text="PARTICIPANTES" Foreground="#6B7280" FontSize="11" FontWeight="Bold" Margin="4,4,4,8"/>
+                            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                <ItemsControl x:Name="ListParticipants">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid Height="44" Margin="0,0,0,8">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <Border Grid.ColumnSpan="2" Background="{Binding RowBackground}" CornerRadius="8"/>
+
+                                                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                                                    <TextBlock Text="{Binding DisplayName}" Foreground="White" FontWeight="Bold" FontSize="13" Opacity="{Binding Opacity}"/>
+                                                    <TextBlock Text="👁" Margin="6,0,0,0" VerticalAlignment="Center"
+                                                               Visibility="{Binding WatchIndicatorVisible, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                                </StackPanel>
+
+                                                <!-- Botão de play: cinza/desligado até a pessoa começar a transmitir,
+                                                     daí fica verde e clicável pra assistir. Clicar de novo (ícone vira
+                                                     "⏸") para de assistir. -->
+                                                <Button Grid.Column="1" Click="BtnViewParticipantStream_Click"
+                                                        IsEnabled="{Binding IsSharing}"
+                                                        Width="30" Height="30" Margin="0,0,7,0"
+                                                        Background="{Binding StatusColor}" Foreground="White" FontSize="11"
+                                                        Content="{Binding PlayIcon}"
+                                                        ToolTip="Clique para assistir / parar de assistir"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </DockPanel>
+                    </Border>
+                </Grid>
+            </Grid>
+
+            <!-- Tela 3: Começar a Transmitir (modal de seleção de fonte) -->
+            <Grid x:Name="ShareModal" Grid.RowSpan="2" Background="#B3000000" Visibility="Collapsed">
+                <Border Background="#1E1E24" Width="580" Height="540" CornerRadius="12" Padding="20">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- LastChildFill="False" é essencial aqui: num DockPanel o
+                             ÚLTIMO filho ignora o alinhamento e ocupa todo o espaço
+                             que sobra. Como o botão de fechar era o último, ele
+                             ficava flutuando no meio em vez de grudar no canto
+                             superior direito. -->
+                        <DockPanel Grid.Row="0" Margin="0,0,0,15" LastChildFill="False">
+                            <TextBlock DockPanel.Dock="Left" Text="Selecione o que compartilhar"
+                                       Foreground="White" FontWeight="Bold" FontSize="16"
+                                       VerticalAlignment="Center"/>
+                            <Button DockPanel.Dock="Right" Content="✕" Click="BtnCloseShareModal_Click"
+                                    Style="{StaticResource CloseModalButtonStyle}"/>
+                        </DockPanel>
+
+                        <TabControl Grid.Row="1" SelectionChanged="TabControl_SelectionChanged" Background="Transparent" BorderThickness="0">
+                            <TabItem Header="Tela Inteira">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,10,0,0">
+                                    <ItemsControl x:Name="DisplayList" ItemTemplate="{StaticResource SourceCardTemplate}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <WrapPanel/>
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </TabItem>
+                            <TabItem Header="Janelas">
+                                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,10,0,0">
+                                    <ItemsControl x:Name="WindowList" ItemTemplate="{StaticResource SourceCardTemplate}">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <WrapPanel/>
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </TabItem>
+                        </TabControl>
+
+                        <StackPanel Grid.Row="2" Margin="0,15,0,0">
+                            <!-- Qualidade da stream: configurada aqui, na hora de começar a
+                                 transmitir, e não numa tela de "Configurações" separada. -->
+                            <Grid Margin="0,0,0,15">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="10"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock Text="Qualidade" Foreground="#A1A1AA" FontSize="11" Margin="0,0,0,5"/>
+                                    <ComboBox x:Name="CmbQuality" SelectedIndex="1">
+                                        <ComboBoxItem Content="720p"/>
+                                        <ComboBoxItem Content="1080p"/>
+                                    </ComboBox>
+                                </StackPanel>
+
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="Taxa de quadros" Foreground="#A1A1AA" FontSize="11" Margin="0,0,0,5"/>
+                                    <ComboBox x:Name="CmbFrameRate" SelectedIndex="0">
+                                        <ComboBoxItem Content="30 fps"/>
+                                        <ComboBoxItem Content="60 fps"/>
+                                    </ComboBox>
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- Toggle no canto inferior esquerdo + botão de iniciar preenchendo o resto -->
+                            <DockPanel LastChildFill="True">
+                                <CheckBox x:Name="AudioToggle" Style="{StaticResource ToggleSwitchStyle}"
+                                          Content="Transmitir com Som" IsChecked="True"
+                                          DockPanel.Dock="Left" VerticalAlignment="Center"/>
+                                <Button Content="Iniciar Transmissão" Click="StartStream_Click" Height="40"
+                                        Background="#23A55A" Foreground="White" FontWeight="Bold" Margin="15,0,0,0"/>
+                            </DockPanel>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+            </Grid>
+            <TextBlock Text="⚡ Vysor" Foreground="White" FontSize="18" FontWeight="Bold"
+                       HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16,7,0,0"
+                       IsHitTestVisible="False"/>
+        </Grid>
+    </Grid>
+</Window>

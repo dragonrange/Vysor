@@ -1,0 +1,15 @@
+[
+  {
+    "Name": "Novo Perfil",
+    "Projects": [
+      {
+        "Path": "VysorClient\\VysorClient.csproj",
+        "Action": "Start"
+      },
+      {
+        "Path": "VysorServer\\VysorServer.csproj",
+        "Action": "Start"
+      }
+    ]
+  }
+]
