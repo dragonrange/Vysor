@@ -12,5 +12,7 @@ COPY --from=build /app/publish .
 # Render encaminha o tráfego HTTP/WebSocket para a porta definida em PORT.
 EXPOSE 10000
 ENV ASPNETCORE_ENVIRONMENT=Production
+# Render limits inotify instances; use polling for .NET file change detection.
+ENV DOTNET_USE_POLLING_FILE_WATCHER=1
 
 ENTRYPOINT ["dotnet", "VysorServer.dll"]
