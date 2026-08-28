@@ -32,8 +32,8 @@ public class VideoEncodeService
 {
     // Access units H.264 já remontadas (SPS+PPS+IDR juntos quando aparecem,
     // ou só um NAL de slice) prontas pra mandar pela rede via
-    // SignalRService.SendFrameAsync (com o prefixo 0x01 adicionado por quem
-    // chama, não por este serviço).
+    // PeerMedia.SendVideo (com o prefixo 0x01 adicionado por quem chama,
+    // não por este serviço).
     //
     // ATENÇÃO pra quem for mexer: este evento é disparado da thread que lê o
     // stdout do ffmpeg. O que estiver inscrito aqui NÃO pode bloquear (nem

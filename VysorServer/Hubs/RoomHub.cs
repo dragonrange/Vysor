@@ -6,10 +6,11 @@ public class RoomHub : Hub
 {
     private readonly RoomManager _roomManager;
 
-    // Usado para repassar vídeo/áudio FORA da chamada do hub (ver
-    // RelayInBackground). O "Clients" normal do Hub não pode ser usado depois
-    // que o método termina, porque o objeto do hub é descartado; o
-    // IHubContext é global e vale a qualquer momento.
+    // Usado só por BroadcastSuccessionAsync pra falar com a sala fora do
+    // fluxo normal do hub (ex: quando alguém anuncia endereço, sem ninguém
+    // ter chamado nada que espere resposta). O "Clients" normal do Hub não
+    // pode ser usado depois que o método termina, porque o objeto do hub é
+    // descartado; o IHubContext é global e vale a qualquer momento.
     private readonly IHubContext<RoomHub> _hubContext;
 
     public RoomHub(RoomManager roomManager, IHubContext<RoomHub> hubContext)
@@ -333,122 +334,25 @@ public class RoomHub : Hub
         await Clients.OthersInGroup(info.RoomCode).SendAsync("UserStoppedSharing", info.UserId);
     }
 
-    // Recebe um frame de tela de quem está compartilhando e repassa pros outros
-    // da mesma sala, identificando o remetente pela identidade estável — é
-    // isso que permite o app mostrar mais de uma transmissão ao mesmo tempo,
-    // cada uma na sua própria telinha, mesmo que duas pessoas tenham o mesmo
-    // nome, e é isso que faz a telinha continuar viva quando quem transmite
-    // reconecta.
-    public Task SendScreenFrame(byte[] frameBytes)
-    {
-        RelayInBackground("ReceiveScreenFrame", frameBytes, isVideo: true);
-        return Task.CompletedTask;
-    }
-
-    // Mesma ideia do SendScreenFrame, mas para os pedaços de áudio (já
-    // comprimidos em μ-law pelo cliente). O servidor não entende nem precisa
-    // entender o conteúdo — só repassa pra quem mais está na sala.
-    public Task SendAudioChunk(byte[] audioBytes)
-    {
-        RelayInBackground("ReceiveAudioChunk", audioBytes, isVideo: false);
-        return Task.CompletedTask;
-    }
-
-    // ---- caminho reserva: repassar mídia para UMA pessoa só ----
+    // ---- NENHUM vídeo ou áudio passa por aqui, de propósito ----
     //
-    // Com o vídeo indo direto entre os PCs, o servidor deixou de repassar
-    // mídia — é isso que faz ele caber num plano grátis. Mas o furo de NAT
-    // não passa em 100% dos casos: de vez em quando um PAR específico não
-    // consegue se falar direto, mesmo com todos os outros funcionando.
+    // Este servidor NÃO tem (e não deve voltar a ter) um método que receba
+    // frame_bytes/audio_bytes e os repasse pra outro cliente. Já existiu um
+    // caminho de reserva assim (SendScreenFrameTo/SendAudioChunkTo, repassando
+    // só o PAR que não conseguisse furar o NAT) e foi ele — mais o caminho
+    // amplo que existia antes dele — que estourou o plano grátis do Render
+    // duas vezes: o Android nunca soube descobrir o próprio endereço externo
+    // (sem STUN), então qualquer sessão em que o celular não estivesse na
+    // MESMA rede local do PC caía neste "reserva" e ficava nele a sessão
+    // inteira, sem nunca migrar pro caminho direto.
     //
-    // Sem esta saída, esse par simplesmente não se veria, e a pessoa não teria
-    // como saber por quê. Com ela, o vídeo desse par (e SÓ dele) volta a
-    // passar por aqui. É o oposto do que era antes: o servidor virou a
-    // exceção, não a regra.
-    public Task SendScreenFrameTo(string targetUserId, byte[] frameBytes)
-    {
-        RelayToUserInBackground("ReceiveScreenFrame", targetUserId, frameBytes, isVideo: true);
-        return Task.CompletedTask;
-    }
-
-    public Task SendAudioChunkTo(string targetUserId, byte[] audioBytes)
-    {
-        RelayToUserInBackground("ReceiveAudioChunk", targetUserId, audioBytes, isVideo: false);
-        return Task.CompletedTask;
-    }
-
-    private void RelayToUserInBackground(string method, string targetUserId, byte[] payload, bool isVideo)
-    {
-        var connectionId = Context.ConnectionId;
-        var info = _roomManager.GetConnectionInfo(connectionId);
-        if (info == null) return;
-
-        var room = _roomManager.GetRoom(info.RoomCode);
-        if (room == null) return;
-        if (!room.Participants.TryGetValue(targetUserId, out var target)) return;
-
-        // Mesma proteção do repasse geral: passou do limite de envios
-        // pendentes, descarta o quadro em vez de segurar a fila de quem manda.
-        if (!_roomManager.TryBeginRelay(connectionId, isVideo)) return;
-
-        var manager = _roomManager;
-        var client = _hubContext.Clients.Client(target.ConnectionId);
-        var senderId = info.UserId;
-
-        _ = Task.Run(async () =>
-        {
-            try { await client.SendAsync(method, senderId, payload); }
-            catch { }
-            finally { manager.EndRelay(connectionId, isVideo); }
-        });
-    }
-
-    // Repassa mídia SEM segurar a chamada do hub.
+    // A decisão agora é: se o caminho direto (PeerTransport, furo de NAT) não
+    // fechar, o quadro é DESCARTADO no cliente — nunca mais vem parar aqui.
+    // Structurally, este servidor só processa texto curto (códigos de sala,
+    // endereços, listas de participantes); ele é incapaz de mover gigabytes
+    // mesmo que um cliente antigo ou malicioso tente chamar um método de
+    // repasse, porque esse método simplesmente não existe mais no Hub.
     //
-    // Este é o coração da correção do travamento. Antes, o método do hub
-    // esperava (await) a entrega para todos os destinatários; o SignalR
-    // processa uma chamada por vez para cada cliente, então um único
-    // espectador com internet ruim segurava a fila do remetente. Com a fila
-    // parada, o servidor deixava de ler daquela conexão, os "pings" de
-    // manutenção não passavam mais no prazo, e o cliente era desconectado por
-    // tempo esgotado — em cascata, todo mundo caía, a sala esvaziava e era
-    // destruída. O resultado que aparecia na tela: as transmissões travavam e
-    // logo em seguida todos recebiam "Sala não encontrada".
-    //
-    // Agora o envio é solto em segundo plano, com um limite de envios
-    // pendentes por remetente. Passou do limite, o quadro é descartado — em
-    // vídeo, perder um quadro é muito melhor do que travar a sala inteira (e
-    // a imagem se recompõe sozinha no próximo quadro-chave, que vem a cada
-    // 1 segundo).
-    private void RelayInBackground(string method, byte[] payload, bool isVideo)
-    {
-        var connectionId = Context.ConnectionId;
-        var info = _roomManager.GetConnectionInfo(connectionId);
-        if (info == null) return;
-
-        if (!_roomManager.TryBeginRelay(connectionId, isVideo)) return; // atrasado demais: descarta
-
-        var manager = _roomManager;
-        var clients = _hubContext.Clients.GroupExcept(info.RoomCode, connectionId);
-        var senderId = info.UserId;
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await clients.SendAsync(method, senderId, payload);
-            }
-            catch
-            {
-                // Destinatário caiu no meio do envio: não é problema nosso.
-            }
-            finally
-            {
-                manager.EndRelay(connectionId, isVideo);
-            }
-        });
-    }
-
     // Queda de conexão. A pessoa NÃO é removida da sala na hora: ela fica
     // marcada como "caiu" e tem alguns segundos pra voltar (o app tenta
     // reconectar sozinho). Se voltar, ninguém percebe que houve interrupção —

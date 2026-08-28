@@ -56,4 +56,4 @@ Depois que tudo funcionar, você pode apontar, por exemplo, `server.seudominio.c
 
 O Free Service entra em sleep após 15 minutos sem tráfego de entrada e leva cerca de um minuto para acordar. Uma nova conexão WebSocket também pode acordá-lo. Conexões ativas podem ser interrompidas quando a instância é reiniciada/substituída, então o cliente deve continuar usando reconexão automática.
 
-Para o Vysor, isso é aceitável para testes e uso hobby, mas o relay de mídia deve ser evitado sempre que possível porque tráfego WebSocket de saída conta como bandwidth.
+Para o Vysor, isso é aceitável para testes e uso hobby. Vídeo e áudio nunca passam por aqui — o servidor não tem mais nenhum método capaz de repassar mídia (foi isso que estourou o plano grátis duas vezes); só sinalização (códigos de sala, endereços, listas de participantes) trafega pelo WebSocket, sempre uns poucos KB.

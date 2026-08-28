@@ -14,11 +14,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\desig\\Documents\\VysorApp\\VysorServer\\VysorServer.csproj",
+      "projectUniqueName": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorServer\\VysorServer.csproj",
       "projectName": "VysorServer",
-      "projectPath": "C:\\Users\\desig\\Documents\\VysorApp\\VysorServer\\VysorServer.csproj",
+      "projectPath": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorServer\\VysorServer.csproj",
       "packagesPath": "C:\\Users\\desig\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\desig\\Documents\\VysorApp\\VysorServer\\obj\\",
+      "outputPath": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorServer\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"

@@ -22,14 +22,14 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Gdk, GLib, GObject, Gio   # noqa: E402
 
-from . import media, portal                                # noqa: E402
+from . import media, portal, peer                           # noqa: E402
 from .protocol import (TAG_H264, TAG_JPEG, tag_frame, split_frame,   # noqa: E402
                        is_keyframe)
-from .signalr import SignalRClient, decode_bytes           # noqa: E402
+from .signalr import SignalRClient                          # noqa: E402
 
 DEFAULT_SERVER = os.environ.get(
     "VYSOR_SERVER",
-    "https://vysorserver-twilight-fog-5952.fly.dev/roomhub")
+    "https://vysorserver-cjxi.onrender.com/roomhub")
 
 # Tamanho em que cada transmissão é decodificada pra caber na telinha. Manter
 # a largura múltipla de 4 evita problemas de alinhamento de linha ao desenhar.
@@ -106,6 +106,20 @@ scale slider {
   min-width: 14px; min-height: 14px; margin: -5px;
 }
 """.encode("utf-8")
+
+
+def _parse_candidate(text):
+    """"192.168.1.42:51820" -> ("192.168.1.42", 51820), ou None se malformado."""
+    if not text or ":" not in text:
+        return None
+    host, _, port_text = text.rpartition(":")
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not host or port <= 0 or port > 65535:
+        return None
+    return (host, port)
 
 
 def _log(what, exc=None):
@@ -289,6 +303,12 @@ class VysorWindow(Gtk.ApplicationWindow):
         self.room_code = None
         self.display_name = ""
         self.connection_state = ""
+
+        # Conexão DIRETA (P2P) com os amigos da sala — ver vysor/peer.py.
+        # Vídeo e áudio SÓ vão por aqui: o servidor não tem mais nenhum
+        # método capaz de repassar mídia.
+        self.peer = None
+        self._same_network_stuck = set()   # user_ids com indício de mesma rede presos
 
         # O que fazer assim que a conexão ficar de pé. Sem isso o clique em
         # "Criar Sala" era mandado às cegas alguns milissegundos depois e, se
@@ -525,10 +545,8 @@ class VysorWindow(Gtk.ApplicationWindow):
             elif target == "UserStoppedSharing":
                 self._set_sharing(args[0], False)
                 self.stop_watching(args[0])
-            elif target == "ReceiveScreenFrame":
-                self._on_frame(args[0], decode_bytes(args[1]))
-            elif target == "ReceiveAudioChunk":
-                self._on_audio(args[0], decode_bytes(args[1]))
+            elif target == "PeerCandidates":
+                self._on_peer_candidates(args[0], args[1] or [])
             elif target == "Error":
                 self._show_error(args[0])
         except Exception as e:
@@ -611,16 +629,181 @@ class VysorWindow(Gtk.ApplicationWindow):
                 info["play"].set_sensitive(True)
                 info["play"].set_label("■")
 
+        self._start_peer_transport()
+
+    # ---------------- conexão direta (P2P) ----------------
+    #
+    # Sem isto, este cliente Linux só sabia falar com o servidor — e o
+    # servidor não tem mais nenhum jeito de repassar vídeo/áudio. Espelha
+    # PeerMedia.Start (Windows) e MainActivity.startPeers (Android): abre o
+    # socket UDP, manda o endereço de casa NA HORA (conecta instantâneo com
+    # quem estiver no mesmo Wi-Fi) e, em paralelo, descobre o endereço
+    # externo via STUN pra fechar com quem estiver longe.
+    def _start_peer_transport(self):
+        if self.peer is not None:
+            return
+        if not peer.CRYPTO_AVAILABLE:
+            self._notice("Sem o pacote python3-cryptography, vídeo/áudio não "
+                         "conseguem ir direto entre os aparelhos (veja o LEIAME).")
+            return
+
+        room_key = peer.derive_key(self.room_code)
+        transport = peer.PeerTransport(
+            self.my_id, room_key,
+            on_frame=self._on_peer_frame_threadsafe,
+            on_state=self._on_peer_state_threadsafe,
+            on_same_network_stuck=self._on_same_network_stuck_threadsafe)
+
+        if not transport.start():
+            _log("não consegui abrir o socket UDP do caminho direto")
+            return
+        self.peer = transport
+
+        for uid in self.participants:
+            if uid != self.my_id:
+                self.peer.add_peer(uid, [])
+                self._update_link_status(uid)
+
+        threading.Thread(target=self._announce_myself, daemon=True,
+                         name="VysorPeerAnnounce").start()
+
+    def _announce_myself(self):
+        """Roda fora da thread da interface: descobrir o endereço externo
+        fala com servidores na internet e pode levar segundos."""
+        transport = self.peer
+        if transport is None:
+            return
+        local_ip = peer.local_ip_guess()
+        local_candidates = []
+        if local_ip:
+            local_candidates.append(f"{local_ip}:{transport.local_port()}")
+            prefix = peer.subnet_prefix(local_ip)
+            if prefix:
+                transport.set_local_subnet_prefixes({prefix})
+
+        # Manda o endereço de casa JÁ: quem está no mesmo Wi-Fi conecta na
+        # hora, sem esperar o STUN (que pode levar segundos, ou nunca
+        # responder numa rede que bloqueia esse tráfego).
+        if local_candidates and self.signalr:
+            try:
+                self.signalr.invoke("AnnounceCandidates", local_candidates)
+            except Exception:
+                pass
+
+        external = None
+        for host, port in peer.PUBLIC_STUN_SERVERS:
+            server = peer.resolve_stun_server(host, port)
+            if server is None:
+                continue
+            mapped = transport.query_stun(server, timeout=3.0)
+            if mapped:
+                external = f"{mapped[0]}:{mapped[1]}"
+                break
+
+        if external and self.signalr:
+            all_candidates = [external] + local_candidates
+            try:
+                self.signalr.invoke("AnnounceCandidates", all_candidates)
+            except Exception:
+                pass
+
+    def _stop_peer_transport(self):
+        if self.peer is not None:
+            self.peer.stop()
+            self.peer = None
+        self._same_network_stuck.clear()
+
+    def _on_peer_candidates(self, uid, raw_candidates):
+        if self.peer is None or uid == self.my_id:
+            return
+        parsed = []
+        for text in raw_candidates:
+            addr = _parse_candidate(text)
+            if addr:
+                parsed.append(addr)
+        if parsed:
+            self.peer.add_peer(uid, parsed)
+
+    # Os três callbacks abaixo vêm de threads de rede do peer.PeerTransport —
+    # nunca tocam a tela diretamente, só agendam via GLib.idle_add (mesma
+    # regra do SignalRClient).
+    def _on_peer_frame_threadsafe(self, sender, kind, data):
+        GLib.idle_add(self._handle_peer_frame, sender, kind, data)
+
+    def _handle_peer_frame(self, sender, kind, data):
+        if not self._alive:
+            return False
+        if kind == peer.KIND_VIDEO:
+            self._on_frame(sender, data)
+        else:
+            self._on_audio(sender, data)
+        return False
+
+    def _on_peer_state_threadsafe(self, uid, connected):
+        GLib.idle_add(self._handle_peer_state, uid, connected)
+
+    def _handle_peer_state(self, uid, connected):
+        if not self._alive:
+            return False
+        if connected:
+            self._same_network_stuck.discard(uid)
+        self._update_link_status(uid)
+        return False
+
+    def _on_same_network_stuck_threadsafe(self, uid):
+        GLib.idle_add(self._handle_same_network_stuck, uid)
+
+    def _handle_same_network_stuck(self, uid):
+        if not self._alive:
+            return False
+        self._same_network_stuck.add(uid)
+        self._update_link_status(uid)
+        self._notice("Mesma rede, mas sem conexão direta — veja o isolamento "
+                     "de cliente/AP no roteador.")
+        return False
+
+    def _update_link_status(self, uid):
+        """Sem servidor de repasse, se o caminho direto não fechar essa
+        pessoa nunca chega — este texto embaixo do nome existe pra explicar
+        por quê, em vez de deixar a telinha preta sem nenhuma pista."""
+        info = self.participants.get(uid)
+        if not info or not info.get("link_label"):
+            return
+        label = info["link_label"]
+        if self.peer is not None and self.peer.is_connected(uid):
+            label.set_visible(False)
+            return
+        if uid in self._same_network_stuck:
+            label.set_text("Mesma rede, sem conexão direta")
+            label.add_css_class("notice")
+        else:
+            label.set_text("Conectando direto…")
+            label.remove_css_class("notice")
+        label.set_visible(True)
+
     def _add_participant(self, uid, name):
         if uid in self.participants:
             return
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         row.add_css_class("participant")
+
+        name_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        name_col.set_hexpand(True)
         label = Gtk.Label(label=name + (" (você)" if uid == self.my_id else ""),
                           xalign=0, hexpand=True)
         label.set_ellipsize(3)   # Pango.EllipsizeMode.END
-        row.append(label)
+        name_col.append(label)
+
+        # Sem servidor de repasse, se o caminho direto não fechar essa pessoa
+        # nunca chega — este texto existe pra explicar por quê. Some sozinho
+        # assim que o furo de NAT confirma (ver _update_link_status).
+        link_label = Gtk.Label(xalign=0)
+        link_label.add_css_class("hint")
+        link_label.set_visible(False)
+        name_col.append(link_label)
+
+        row.append(name_col)
 
         play = Gtk.Button(label="▶")
         play.add_css_class("success")
@@ -635,10 +818,18 @@ class VysorWindow(Gtk.ApplicationWindow):
 
         self.participants_box.append(row)
         self.participants[uid] = {"name": name, "row": row, "play": play,
-                                  "sharing": False, "label": label}
+                                  "sharing": False, "label": label,
+                                  "link_label": link_label}
+
+        if uid != self.my_id and self.peer is not None:
+            self.peer.add_peer(uid, [])
+            self._update_link_status(uid)
 
     def _remove_participant(self, uid):
         self.stop_watching(uid)
+        if self.peer is not None and uid != self.my_id:
+            self.peer.remove_peer(uid)
+        self._same_network_stuck.discard(uid)
         info = self.participants.pop(uid, None)
         if info:
             self.participants_box.remove(info["row"])
@@ -916,11 +1107,15 @@ class VysorWindow(Gtk.ApplicationWindow):
             self.portal = None
 
     def _on_encoded(self, au: bytes):
-        """Vem de uma thread do GStreamer — só manda pra rede, não toca na tela."""
-        if not self.sharing or not self.signalr:
+        """Vem de uma thread do GStreamer — só manda pra rede, não toca na tela.
+
+        Sem servidor de repasse: manda direto (UDP) pra cada amigo cujo furo
+        de NAT já fechou. Quem ainda não conectou perde o quadro — não existe
+        mais nenhum caminho de reserva pelo servidor (ver peer.py)."""
+        if not self.sharing or not self.peer:
             return
         self._frames_sent += 1
-        self.signalr.invoke_media("SendScreenFrame", tag_frame(TAG_H264, au))
+        self.peer.broadcast(peer.KIND_VIDEO, tag_frame(TAG_H264, au))
         # A prévia é desenhada na thread da interface, nunca aqui.
         GLib.idle_add(self._feed_self_preview, au)
 
@@ -930,8 +1125,8 @@ class VysorWindow(Gtk.ApplicationWindow):
         return False
 
     def _on_audio_chunk(self, chunk: bytes):
-        if self.sharing and self.signalr:
-            self.signalr.invoke_media("SendAudioChunk", chunk)
+        if self.sharing and self.peer:
+            self.peer.broadcast(peer.KIND_AUDIO, chunk)
 
     # ---------------- permissão de captura guardada ----------------
 
@@ -961,6 +1156,7 @@ class VysorWindow(Gtk.ApplicationWindow):
 
     def _on_leave(self, *_):
         self._stop_sharing()
+        self._stop_peer_transport()
         for uid in list(self.tiles):
             self.stop_watching(uid)
         if self.signalr and self.room_code:
@@ -976,6 +1172,7 @@ class VysorWindow(Gtk.ApplicationWindow):
     def shutdown(self):
         self._alive = False
         self._stop_sharing()
+        self._stop_peer_transport()
         for uid in list(self.tiles):
             self.stop_watching(uid)
         if self.signalr:
@@ -1087,7 +1284,36 @@ REQUIRED_ELEMENTS = [
 ]
 
 
+def _crypto_install_hint():
+    import shutil
+    if shutil.which("apt"):
+        return "sudo apt install python3-cryptography"
+    if shutil.which("dnf"):
+        return "sudo dnf install python3-cryptography"
+    if shutil.which("pacman"):
+        return "sudo pacman -S python-cryptography"
+    return None
+
+
 def main():
+    # Sem isto, o vídeo/áudio não têm como ir direto entre os aparelhos (é o
+    # ÚNICO caminho que existe — o servidor não repassa mídia de jeito
+    # nenhum, ver peer.py) e o app abriria "funcionando" só pra ninguém
+    # nunca se ver. Melhor recusar a abrir e dizer exatamente o que falta,
+    # do mesmo jeito que já é feito pras peças do GStreamer abaixo.
+    if not peer.CRYPTO_AVAILABLE:
+        print("O Vysor precisa do pacote python3-cryptography (é ele que faz "
+              "AES-GCM de verdade — a biblioteca padrão do Python não tem).",
+              file=sys.stderr)
+        hint = _crypto_install_hint()
+        if hint:
+            print("\nPra instalar, copie e cole no terminal:\n", file=sys.stderr)
+            print("  " + hint + "\n", file=sys.stderr)
+        else:
+            print("\nProcure o pacote 'python3-cryptography' (ou "
+                  "'python-cryptography') da sua distribuição.\n", file=sys.stderr)
+        return 1
+
     media.init()
     missing = media.missing_elements(REQUIRED_ELEMENTS)
     if missing:

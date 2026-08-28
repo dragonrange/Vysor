@@ -92,9 +92,6 @@ public class RoomManager
     private readonly ConcurrentDictionary<string, Room> _rooms = new();
     private readonly ConcurrentDictionary<string, ConnectionInfo> _connections = new();
 
-    // Quantos envios simultâneos ainda não concluídos cada remetente pode ter.
-    private readonly ConcurrentDictionary<string, int> _inFlightRelays = new();
-
     // Por quanto tempo uma sala vazia continua existindo antes de ser
     // descartada de vez. Generoso de propósito: o custo de manter uma sala
     // vazia na memória é irrisório (um punhado de bytes), enquanto apagá-la
@@ -125,8 +122,6 @@ public class RoomManager
     public void UntrackConnection(string connectionId)
     {
         _connections.TryRemove(connectionId, out _);
-        _inFlightRelays.TryRemove("v:" + connectionId, out _);
-        _inFlightRelays.TryRemove("a:" + connectionId, out _);
     }
 
     // --- Salas ---------------------------------------------------------------
@@ -231,48 +226,6 @@ public class RoomManager
         }
 
         return departures;
-    }
-
-    // --- Controle de fluxo do repasse de vídeo/áudio -------------------------
-    //
-    // Impede que um espectador com internet ruim segure a transmissão de todo
-    // mundo. Antes, o servidor esperava a entrega para CADA destinatário antes
-    // de aceitar o próximo quadro do remetente; um único participante lento
-    // travava a sala inteira e, por tabela, fazia o servidor parar de responder
-    // aos "pings" de conexão — o que derrubava todo mundo e (aí sim) matava a
-    // sala. Agora o repasse é solto, e quando o remetente acumula envios
-    // demais ainda pendentes, o quadro novo é simplesmente descartado.
-    //
-    // Vídeo e áudio têm cotas SEPARADAS de propósito. Um quadro de vídeo é
-    // milhares de vezes maior que um pedacinho de áudio; se dividissem a
-    // mesma cota, um quadro pesado em trânsito faria o áudio ser descartado
-    // junto — e falha no som incomoda muito mais do que um quadro perdido.
-    public const int MaxInFlightVideoPerSender = 3;
-    public const int MaxInFlightAudioPerSender = 12;
-
-    public bool TryBeginRelay(string connectionId, bool isVideo)
-    {
-        string key = (isVideo ? "v:" : "a:") + connectionId;
-        int max = isVideo ? MaxInFlightVideoPerSender : MaxInFlightAudioPerSender;
-
-        while (true)
-        {
-            int current = _inFlightRelays.GetOrAdd(key, 0);
-            if (current >= max) return false;
-            if (_inFlightRelays.TryUpdate(key, current + 1, current)) return true;
-        }
-    }
-
-    public void EndRelay(string connectionId, bool isVideo)
-    {
-        string key = (isVideo ? "v:" : "a:") + connectionId;
-
-        while (true)
-        {
-            if (!_inFlightRelays.TryGetValue(key, out int current)) return;
-            if (current <= 0) return;
-            if (_inFlightRelays.TryUpdate(key, current - 1, current)) return;
-        }
     }
 
     // Gera um código curto tipo "XJ4K9P", parecido com o do Beacon.

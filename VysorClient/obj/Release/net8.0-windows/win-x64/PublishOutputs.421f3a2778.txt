@@ -1,0 +1,2 @@
+C:\Users\desig\Documents\VysorApp\Vysor\VysorClient\publish\Vysor.pdb
+C:\Users\desig\Documents\VysorApp\Vysor\VysorClient\publish\Vysor.exe

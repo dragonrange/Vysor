@@ -21,7 +21,7 @@ public class SignalRService
     // Dá pra trocar o endereço sem recompilar: basta um arquivo "server.txt"
     // do lado do Vysor.exe com a URL nova.
     private const string DefaultServerUrl =
-        "https://vysorserver.onrender.com/roomhub";
+        "https://vysorserver-cjxi.onrender.com/roomhub";
 
     private HubConnection? _connection;
 
@@ -64,8 +64,6 @@ public class SignalRService
     public event Action<string, string>? OnUserJoined; // id, displayName
     public event Action<string>? OnUserLeft; // id
     public event Action<string>? OnUserStoppedSharing; // id
-    public event Action<string, byte[]>? OnFrameReceived; // id, frameBytes
-    public event Action<string, byte[]>? OnAudioChunkReceived; // id, audioBytes
 
     // Mensagem de erro vinda do servidor (ex: "Sala não encontrada").
     public event Action<string>? OnServerError;
@@ -236,8 +234,10 @@ public class SignalRService
                 .WithUrl(url, options =>
                 {
                     options.Transports = Microsoft.AspNetCore.Http.Connections.HttpTransportType.WebSockets;
-                    options.ApplicationMaxBufferSize = 10 * 1024 * 1024;
-                    options.TransportMaxBufferSize = 10 * 1024 * 1024;
+                    // Só sinalização passa por aqui agora (ver PeerMedia.cs);
+                    // 256 KB é folga generosa pra isso.
+                    options.ApplicationMaxBufferSize = 256 * 1024;
+                    options.TransportMaxBufferSize = 256 * 1024;
                 })
                 // Tentativas de reconexão CURTAS de propósito.
                 //
@@ -264,14 +264,11 @@ public class SignalRService
             connection.On<string>("UserLeft", (id) => OnUserLeft?.Invoke(id));
             connection.On<string>("UserStoppedSharing", (id) => OnUserStoppedSharing?.Invoke(id));
             connection.On<string>("Error", (message) => OnServerError?.Invoke(message));
-            connection.On<string, byte[]>("ReceiveScreenFrame", (userId, frameBytes) =>
-            {
-                OnFrameReceived?.Invoke(userId, frameBytes);
-            });
-            connection.On<string, byte[]>("ReceiveAudioChunk", (userId, audioBytes) =>
-            {
-                OnAudioChunkReceived?.Invoke(userId, audioBytes);
-            });
+
+            // NÃO existe (e não deve voltar a existir) um handler pra
+            // "ReceiveScreenFrame"/"ReceiveAudioChunk" aqui — o servidor não
+            // tem mais nenhum método capaz de mandar isso (ver RoomHub.cs).
+            // Todo vídeo/áudio chega só pelo caminho direto (PeerMedia).
 
             // A fila de sucessão distribuída pelo host: quem mais pode receber
             // a sala, e em que ordem. Guardamos assim que chega, ANTES de
@@ -463,64 +460,21 @@ public class SignalRService
         catch { }
     }
 
-    // Os dois envios abaixo são chamados em "fire and forget" (sem ninguém
-    // esperando o resultado) dezenas de vezes por segundo. O try/catch é
-    // essencial: entre checar IsConnected e enviar de fato, a conexão pode
-    // cair, e uma exceção numa tarefa que ninguém observa fica invisível —
-    // o app parecia continuar transmitindo enquanto nada saía.
+    // Chamado em "fire and forget" (sem ninguém esperando o resultado). O
+    // try/catch é essencial: entre checar IsConnected e enviar de fato, a
+    // conexão pode cair, e uma exceção numa tarefa que ninguém observa fica
+    // invisível — o app parecia continuar funcionando enquanto nada saía.
     // Anuncia por onde os amigos conseguem falar direto com este PC.
+    //
+    // NÃO existe (e não deve voltar a existir) um "SendFrameToAsync" ou
+    // equivalente aqui. Vídeo e áudio só saem pelo socket UDP do
+    // PeerTransport — nunca por uma chamada ao Hub. Ver PeerMedia.cs.
     public async Task AnnounceCandidatesAsync(string[] candidates)
     {
         try
         {
             if (_connection != null && IsConnected)
                 await _connection.InvokeAsync("AnnounceCandidates", candidates);
-        }
-        catch { }
-    }
-
-    // Caminho reserva: manda para UMA pessoa através do servidor, quando o
-    // caminho direto com ela não fechou. Usado só nesse caso.
-    public async Task SendFrameToAsync(string targetUserId, byte[] frameBytes)
-    {
-        try
-        {
-            if (_connection != null && IsConnected)
-                await _connection.SendAsync("SendScreenFrameTo", targetUserId, frameBytes);
-        }
-        catch { }
-    }
-
-    public async Task SendAudioChunkToAsync(string targetUserId, byte[] audioBytes)
-    {
-        try
-        {
-            if (_connection != null && IsConnected)
-                await _connection.SendAsync("SendAudioChunkTo", targetUserId, audioBytes);
-        }
-        catch { }
-    }
-
-    public async Task SendFrameAsync(byte[] frameBytes)
-    {
-        try
-        {
-            if (_connection != null && IsConnected)
-            {
-                await _connection.SendAsync("SendScreenFrame", frameBytes);
-            }
-        }
-        catch { }
-    }
-
-    public async Task SendAudioChunkAsync(byte[] audioBytes)
-    {
-        try
-        {
-            if (_connection != null && IsConnected)
-            {
-                await _connection.SendAsync("SendAudioChunk", audioBytes);
-            }
         }
         catch { }
     }

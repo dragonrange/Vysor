@@ -21,7 +21,7 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   gstreamer1.0-libav gstreamer1.0-pipewire \
-  xdg-desktop-portal pulseaudio-utils
+  xdg-desktop-portal pulseaudio-utils python3-cryptography
 ```
 
 E mais **um** destes, conforme o seu ambiente de trabalho:
@@ -38,7 +38,8 @@ sudo apt install xdg-desktop-portal-wlr     # Sway, Hyprland e afins
 sudo dnf install python3-gobject gtk4 \
   gstreamer1-plugins-base gstreamer1-plugins-good \
   gstreamer1-plugins-bad-free gstreamer1-libav \
-  gstreamer1-plugin-pipewire xdg-desktop-portal pulseaudio-utils
+  gstreamer1-plugin-pipewire xdg-desktop-portal pulseaudio-utils \
+  python3-cryptography
 ```
 
 O Fedora não distribui o `gstreamer1-plugins-ugly` (que tem o codificador de
@@ -55,7 +56,8 @@ sudo dnf install gstreamer1-plugins-ugly
 ```bash
 sudo pacman -S python-gobject gtk4 \
   gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly \
-  gst-libav gst-plugin-pipewire xdg-desktop-portal libpulse
+  gst-libav gst-plugin-pipewire xdg-desktop-portal libpulse \
+  python-cryptography
 ```
 
 Mais o portal do seu ambiente: `xdg-desktop-portal-gnome`,
@@ -155,8 +157,17 @@ acontecer, rode pelo terminal e copie o que aparecer lá.
 | `vysor/app.py` | a interface (GTK4) e a lógica da sala |
 | `vysor/media.py` | captura, codificação e reprodução (GStreamer) |
 | `vysor/portal.py` | a permissão de captura de tela no Wayland (D-Bus) |
-| `vysor/signalr.py` | a conversa com o servidor (WebSocket, só biblioteca padrão) |
+| `vysor/signalr.py` | a conversa com o servidor (WebSocket, só biblioteca padrão) — só sinalização, sala e endereços |
+| `vysor/peer.py` | a conexão DIRETA (P2P) com os amigos: furo de NAT por UDP, vídeo/áudio cifrados — é por aqui que a tela e o som passam de verdade |
 | `vysor/protocol.py` | o formato exato dos dados trocados com o cliente Windows |
 
 O vídeo trafega como H.264 e o áudio como G.711 μ-law a 48 kHz — exatamente o
 mesmo formato do cliente Windows, que é o que permite os dois conversarem.
+
+O servidor de sinalização **não repassa vídeo nem áudio de jeito nenhum** —
+só apresenta um cliente ao outro (código de sala, endereços) pra que o vídeo
+vá direto entre os dois computadores. Se o furo de NAT não fechar com um
+amigo específico, a transmissão dele simplesmente não chega (a lista de
+participantes mostra "Conectando direto…" ou, se parecer que vocês estão na
+mesma rede mas mesmo assim não fechou, um aviso sobre isolamento de
+cliente/AP no roteador).

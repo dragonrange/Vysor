@@ -191,9 +191,8 @@ public partial class MainWindow : Window
         _failover = new HostFailover(_signalR);
         _peerMedia = new PeerMedia(_signalR);
 
-        // Vídeo e áudio que chegaram pelo caminho DIRETO entram exatamente
-        // pela mesma porta do que chega pelo servidor: o resto do app não
-        // precisa saber por onde veio.
+        // Único caminho de entrada de vídeo/áudio: o direto (P2P). O servidor
+        // não tem mais como mandar isto (ver RoomHub.cs).
         _peerMedia.OnVideo += (userId, frameBytes) =>
             Dispatcher.Invoke(() => HandleIncomingFrame(userId, frameBytes));
         _peerMedia.OnAudio += HandleIncomingAudio;
@@ -239,6 +238,7 @@ public partial class MainWindow : Window
             string myName = string.IsNullOrWhiteSpace(TxtDisplayName.Text) ? "Você" : TxtDisplayName.Text;
             _participants.Add(new ParticipantViewModel { UserId = myId, DisplayName = myName });
             ListParticipants.ItemsSource = _participants;
+            RefreshLinkStatuses();
         });
 
         _signalR.OnRoomJoined += (code, myId, ids, names) => Dispatcher.Invoke(() =>
@@ -274,6 +274,7 @@ public partial class MainWindow : Window
                 });
             }
             ListParticipants.ItemsSource = _participants;
+            RefreshLinkStatuses();
 
             // Se eu já estava transmitindo quando entrei aqui (caso de uma
             // reconexão automática), a transmissão continua — só preciso
@@ -339,14 +340,34 @@ public partial class MainWindow : Window
         // Cada frame chega com 1 byte de marcador na frente: 0x00 = JPEG
         // (pipeline de sempre), 0x01 = access unit H.264 (pipeline por
         // hardware). Isso deixa cada participante livre pra usar o
-        // pipeline que funcionar no PC dele — o servidor nunca precisa
-        // saber a diferença, só repassa bytes opacos como sempre.
-        _signalR.OnFrameReceived += (userId, frameBytes) =>
-            Dispatcher.Invoke(() => HandleIncomingFrame(userId, frameBytes));
-
-        _signalR.OnAudioChunkReceived += HandleIncomingAudio;
+        // pipeline que funcionar no PC dele.
+        //
+        // Só existe UM caminho de entrada agora: _peerMedia.OnVideo/OnAudio,
+        // registrado lá em cima. O servidor não tem mais como mandar vídeo ou
+        // áudio (ver RoomHub.cs), então não existe handler equivalente pra
+        // "veio pelo servidor" — se P2P não conectar com alguém, o quadro
+        // dessa pessoa nunca chega, e é isso que o indicador de conexão da
+        // lista de participantes (abaixo) existe pra explicar.
+        _peerMedia.OnPathsChanged += () => Dispatcher.Invoke(RefreshLinkStatuses);
+        _peerMedia.OnSameNetworkStuck += (userId) => Dispatcher.Invoke(() =>
+        {
+            var p = _participants.FirstOrDefault(x => x.UserId == userId);
+            if (p != null) p.SameNetworkStuck = true;
+        });
 
         ContinuarInit();
+    }
+
+    // Atualiza o indicador "conectando… / direto" de cada participante na
+    // lista. Chamado sempre que algum caminho direto muda de estado (ver
+    // _peerMedia.OnPathsChanged) e ao popular a lista pela primeira vez.
+    private void RefreshLinkStatuses()
+    {
+        if (_peerMedia == null) return;
+        foreach (var p in _participants)
+        {
+            p.IsDirect = _peerMedia.IsDirect(p.UserId);
+        }
     }
 
     // Um quadro chegou — não importa se veio direto do PC do amigo ou pelo

@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("VysorServer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4c6f6de33cae901a5e29cdfcdd83f4ac78544258")]
 [assembly: System.Reflection.AssemblyProductAttribute("VysorServer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("VysorServer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

@@ -1,0 +1,37 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{A1E5C6C1-2C1F-4C7E-9C1E-000000000001}|VysorClient\\VysorClient.csproj|c:\\users\\desig\\documents\\vysorapp\\vysor\\vysorclient\\vysorclient.csproj||{FA3CD31E-987B-443A-9B81-186104E8DAC1}|",
+      "RelativeMoniker": "D:0:0:{A1E5C6C1-2C1F-4C7E-9C1E-000000000001}|VysorClient\\VysorClient.csproj|solutionrelative:vysorclient\\vysorclient.csproj||{FA3CD31E-987B-443A-9B81-186104E8DAC1}|"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "VysorClient",
+              "DocumentMoniker": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorClient\\VysorClient.csproj",
+              "RelativeDocumentMoniker": "VysorClient\\VysorClient.csproj",
+              "ToolTip": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorClient\\VysorClient.csproj",
+              "RelativeToolTip": "VysorClient\\VysorClient.csproj",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000758|",
+              "WhenOpened": "2026-08-21T01:39:21.589Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

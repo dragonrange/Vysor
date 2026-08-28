@@ -11,10 +11,14 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 // Registra o SignalR (o motor de comunicação em tempo real).
 builder.Services.AddSignalR(options =>
 {
-    // Vídeo + áudio no mesmo canal podem gerar mensagens maiores que o
-    // padrão do SignalR: liberamos até 10 MB por mensagem (um frame JPEG
-    // de 1080p comprimido fica bem abaixo disso, mas deixamos folga).
-    options.MaximumReceiveMessageSize = 10 * 1024 * 1024;
+    // Este servidor não repassa mais vídeo nem áudio de jeito nenhum (ver
+    // RoomHub.cs) — só sinalização (códigos de sala, endereços, listas de
+    // participantes), sempre uns poucos KB. 256 KB é folga generosa pra isso;
+    // NÃO aumente este valor pra "resolver" um problema de vídeo — se um
+    // frame estiver tentando passar por aqui, o bug está em outro lugar (o
+    // cliente caiu de volta pra um caminho de repasse que não deveria
+    // existir mais).
+    options.MaximumReceiveMessageSize = 256 * 1024;
 
     // Prazos de manutenção da conexão, mais folgados que o padrão (15s/30s).
     // Sob carga de vídeo, um pico de tráfego podia atrasar o "ping" de
@@ -75,12 +79,11 @@ app.MapGet("/room/{code}", (string code, RoomManager rooms) =>
 // Aqui é onde os clientes (o app Vysor dos seus amigos) vão se conectar.
 app.MapHub<RoomHub>("/roomhub", options =>
 {
-    // O padrão do SignalR pro buffer de saída é 32 KB — muito pequeno pra
-    // quadros de vídeo. Com o buffer estourando o tempo todo, cada envio
-    // ficava esperando, e essa espera se propagava até derrubar conexões.
-    // Aqui damos a mesma folga que o cliente já usa (10 MB).
-    options.ApplicationMaxBufferSize = 10 * 1024 * 1024;
-    options.TransportMaxBufferSize = 10 * 1024 * 1024;
+    // Idem: o padrão de 32 KB do SignalR já sobra pra sinalização. Não
+    // precisa mais da folga de antes, porque vídeo/áudio nunca mais entram
+    // nesse buffer.
+    options.ApplicationMaxBufferSize = 256 * 1024;
+    options.TransportMaxBufferSize = 256 * 1024;
 });
 
 app.Run();

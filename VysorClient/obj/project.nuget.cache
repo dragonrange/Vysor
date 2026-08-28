@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "2pPXKbvWxD4=",
+  "dgSpecHash": "2DngzcDZV3o=",
   "success": true,
-  "projectFilePath": "C:\\Users\\desig\\Documents\\VysorApp\\VysorClient\\VysorClient.csproj",
+  "projectFilePath": "C:\\Users\\desig\\Documents\\VysorApp\\Vysor\\VysorClient\\VysorClient.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.aspnetcore.connections.abstractions\\8.0.30\\microsoft.aspnetcore.connections.abstractions.8.0.30.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.aspnetcore.http.connections.client\\8.0.30\\microsoft.aspnetcore.http.connections.client.8.0.30.nupkg.sha512",
@@ -18,7 +18,6 @@
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.extensions.logging.abstractions\\8.0.3\\microsoft.extensions.logging.abstractions.8.0.3.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.extensions.options\\8.0.2\\microsoft.extensions.options.8.0.2.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.extensions.primitives\\8.0.0\\microsoft.extensions.primitives.8.0.0.nupkg.sha512",
-    "C:\\Users\\desig\\.nuget\\packages\\microsoft.net.illink.tasks\\8.0.30\\microsoft.net.illink.tasks.8.0.30.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.netcore.platforms\\3.1.0\\microsoft.netcore.platforms.3.1.0.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.win32.registry\\4.7.0\\microsoft.win32.registry.4.7.0.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\microsoft.win32.systemevents\\10.0.11\\microsoft.win32.systemevents.10.0.11.nupkg.sha512",
@@ -33,10 +32,7 @@
     "C:\\Users\\desig\\.nuget\\packages\\system.io.pipelines\\8.0.0\\system.io.pipelines.8.0.0.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\system.security.accesscontrol\\4.7.0\\system.security.accesscontrol.4.7.0.nupkg.sha512",
     "C:\\Users\\desig\\.nuget\\packages\\system.security.principal.windows\\4.7.0\\system.security.principal.windows.4.7.0.nupkg.sha512",
-    "C:\\Users\\desig\\.nuget\\packages\\system.threading.channels\\8.0.0\\system.threading.channels.8.0.0.nupkg.sha512",
-    "C:\\Users\\desig\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\8.0.30\\microsoft.netcore.app.runtime.win-x64.8.0.30.nupkg.sha512",
-    "C:\\Users\\desig\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\8.0.30\\microsoft.windowsdesktop.app.runtime.win-x64.8.0.30.nupkg.sha512",
-    "C:\\Users\\desig\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\8.0.30\\microsoft.aspnetcore.app.runtime.win-x64.8.0.30.nupkg.sha512"
+    "C:\\Users\\desig\\.nuget\\packages\\system.threading.channels\\8.0.0\\system.threading.channels.8.0.0.nupkg.sha512"
   ],
   "logs": []
 }

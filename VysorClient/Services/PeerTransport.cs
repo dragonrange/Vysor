@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -57,6 +58,15 @@ public class PeerTransport : IDisposable
         public IPEndPoint? Confirmed { get; set; }
         public DateTime LastHeard { get; set; }
         public uint NextFrameId;
+
+        // Algum dos endereços anunciados por este amigo cai no mesmo /24 de
+        // algum dos NOSSOS próprios endereços locais? Só um indício (redes
+        // domésticas normalmente usam /24, mas nem sempre) — usado só pra
+        // UI explicar melhor uma demora, nunca pra decidir o furo de NAT em
+        // si (isso continua tentando TODOS os candidatos, sempre).
+        public bool SameNetworkHint;
+        public DateTime FirstSeenAt = DateTime.UtcNow;
+        public bool StuckNotified;
     }
 
     private readonly string _myUserId;
@@ -74,6 +84,17 @@ public class PeerTransport : IDisposable
 
     // Um amigo passou a estar (ou deixou de estar) alcançável direto.
     public event Action<string, bool>? OnPeerStateChanged;
+
+    // Amigo com indício de mesma rede que não conseguiu furar o NAT depois de
+    // um tempo razoável. Ver SameNetworkStuckAfter.
+    public event Action<string>? OnSameNetworkStuck;
+
+    private static readonly TimeSpan SameNetworkStuckAfter = TimeSpan.FromSeconds(6);
+
+    // Prefixos /24 ("a.b.c") dos NOSSOS endereços locais, calculados uma vez
+    // no Start(). Usado só pra comparar com os candidatos que os amigos
+    // anunciam (ver Peer.SameNetworkHint).
+    private HashSet<string> _localSubnetPrefixes = new();
 
     public PeerTransport(string myUserId, byte[] roomKey)
     {
@@ -105,6 +126,12 @@ public class PeerTransport : IDisposable
 
             _socket.Bind(new IPEndPoint(IPAddress.Any, port));
             _socket.ReceiveTimeout = 500;
+
+            _localSubnetPrefixes = LocalAddresses.List()
+                .Select(c => SubnetPrefix(c.Address))
+                .Where(p => p != null)
+                .Select(p => p!)
+                .ToHashSet();
 
             // Sem isto, no Windows, um pacote que "voltou" de um endereço
             // fechado derruba o socket inteiro com uma exceção — e a conexão
@@ -153,11 +180,28 @@ public class PeerTransport : IDisposable
         {
             foreach (var candidate in candidates)
             {
-                if (candidate != null && !peer.Candidates.Contains(candidate))
-                    peer.Candidates.Add(candidate);
+                if (candidate == null || peer.Candidates.Contains(candidate)) continue;
+                peer.Candidates.Add(candidate);
+
+                string? prefix = SubnetPrefix(candidate.Address.ToString());
+                if (prefix != null && _localSubnetPrefixes.Contains(prefix))
+                    peer.SameNetworkHint = true;
             }
         }
     }
+
+    // "192.168.1.42" -> "192.168.1". Comparação /24 simples, de propósito:
+    // cobre a esmagadora maioria das redes domésticas sem precisar entender
+    // máscara de sub-rede de verdade (que o app nem tem como saber, só olhando
+    // um IP isolado).
+    private static string? SubnetPrefix(string ipv4)
+    {
+        int last = ipv4.LastIndexOf('.');
+        return last <= 0 ? null : ipv4[..last];
+    }
+
+    public bool IsSameNetworkHint(string userId) =>
+        _peers.TryGetValue(userId, out var peer) && peer.SameNetworkHint;
 
     public void RemovePeer(string userId) => _peers.TryRemove(userId, out _);
 
@@ -462,6 +506,19 @@ public class PeerTransport : IDisposable
                         List<IPEndPoint> candidates;
                         lock (peer.Candidates) candidates = peer.Candidates.ToList();
                         foreach (var candidate in candidates) SendContact(TypePunch, candidate);
+
+                        // Indício de mesma rede e mesmo assim não furou depois
+                        // de um tempo razoável: a causa mais provável deixa de
+                        // ser "internet ruim" e passa a ser o roteador
+                        // separando os dois aparelhos (isolamento de
+                        // cliente/AP, comum em redes de convidado e em alguns
+                        // roteadores de operadora). Avisa uma vez só.
+                        if (peer.SameNetworkHint && !peer.StuckNotified
+                            && now - peer.FirstSeenAt > SameNetworkStuckAfter)
+                        {
+                            peer.StuckNotified = true;
+                            OnSameNetworkStuck?.Invoke(peer.UserId);
+                        }
                         continue;
                     }
 
@@ -469,7 +526,11 @@ public class PeerTransport : IDisposable
                     {
                         // Sumiu: volta a procurar do zero, inclusive nos
                         // outros endereços (a rede dele pode ter mudado).
+                        // Reinicia também a contagem do aviso de "mesma rede
+                        // travada": se voltar a ficar preso, avisa de novo.
                         peer.Confirmed = null;
+                        peer.FirstSeenAt = now;
+                        peer.StuckNotified = false;
                         OnPeerStateChanged?.Invoke(peer.UserId, false);
                         continue;
                     }

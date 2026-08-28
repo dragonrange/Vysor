@@ -1,6 +1,9 @@
 # VysorServer
 
-Servidor de sinalização e retransmissão de fallback do Vysor (ASP.NET Core + SignalR).
+Servidor de sinalização do Vysor (ASP.NET Core + SignalR) — só sala, códigos e
+troca de endereços pra conexão direta. Não repassa vídeo/áudio de jeito
+nenhum (ver RoomHub.cs): foi repassar mídia que estourou o plano grátis do
+Render duas vezes.
 
 ## Render
 
@@ -18,19 +21,24 @@ O arquivo `render.yaml`, na raiz do repositório, cria/configura o serviço auto
 - Health check: `/status`
 - Instance: `Free` para testes/hobby
 
-A URL pública será parecida com:
+A URL pública atual é:
 
 ```text
-https://vysorserver.onrender.com
+https://vysorserver-cjxi.onrender.com
 ```
 
 O endpoint do SignalR é:
 
 ```text
-https://vysorserver.onrender.com/roomhub
+https://vysorserver-cjxi.onrender.com/roomhub
 ```
 
-> O nome exato do subdomínio pode mudar se `vysorserver` não estiver disponível. Nesse caso, coloque a URL real em `server.txt` ao lado do `Vysor.exe`; o cliente já suporta essa substituição sem recompilar.
+> O nome exato do subdomínio pode mudar se o serviço for recriado no Render
+> (o `vysorserver` puro já não estava disponível, por isso o sufixo). Se
+> mudar de novo, coloque a URL real em `server.txt` ao lado do `Vysor.exe`
+> (Windows) ou em `VYSOR_SERVER` (Linux); os clientes já suportam essa
+> substituição sem recompilar. O Android tem a URL fixa em
+> `SignalRClient.HUB` — esse precisa de recompilação.
 
 ## Rodando localmente
 
@@ -44,4 +52,13 @@ Localmente, o servidor usa `PORT` se ela existir; caso contrário, usa a porta `
 
 As salas ficam em memória. Um restart/redeploy apaga o estado atual das salas. O cliente possui reconexão/reentrada para reduzir o impacto.
 
-O servidor ainda contém métodos de relay de vídeo/áudio como fallback. O caminho preferencial continua sendo P2P UDP entre os clientes.
+## Sobre o relay de vídeo/áudio (removido de propósito)
+
+Este servidor **não tem nenhum método capaz de repassar vídeo ou áudio**. Já
+teve — um caminho de reserva pra quando o furo de NAT falhava pra um par
+específico — e foi exatamente esse caminho (mais o relay amplo que existia
+antes dele) que estourou o plano grátis do Render duas vezes. Todo vídeo/áudio
+vai OBRIGATORIAMENTE direto entre os clientes (UDP + furo de NAT); se o
+caminho direto não fechar, o quadro é descartado no cliente, não repassado
+por aqui. Não reintroduza `SendScreenFrame`/`SendAudioChunk`/variantes sem
+entender essa decisão — ver o comentário no topo de `RoomHub.cs`.

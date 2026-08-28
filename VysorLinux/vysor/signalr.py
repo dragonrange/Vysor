@@ -46,16 +46,11 @@ MSG_CLOSE = 7
 OP_CONT, OP_TEXT, OP_BINARY = 0x0, 0x1, 0x2
 OP_CLOSE, OP_PING, OP_PONG = 0x8, 0x9, 0xA
 
-# Duas filas de saída, de propósito.
-#
-# Um quadro de vídeo pesa milhares de vezes mais que um pedaço de áudio. Numa
-# fila única, um único quadro-chave saindo devagar (internet ruim) empurra pra
-# fora dezenas de pedaços de áudio — e falha no som incomoda MUITO mais do que
-# um quadro perdido, que o olho nem registra. Então: o áudio tem a fila dele,
-# o vídeo tem a dele, e a thread de escrita sempre serve o áudio primeiro.
-# (O servidor faz exatamente essa mesma separação, pelo mesmo motivo.)
-SEND_QUEUE_MAX = 32        # controle + áudio
-VIDEO_QUEUE_MAX = 8        # vídeo: fila curta de propósito, pra não atrasar
+# Uma fila só, de propósito: vídeo e áudio NUNCA passam por aqui (ver
+# peer.py — vão direto, UDP, entre os clientes). O que sobra pra esta conexão
+# é só sinalização (códigos de sala, endereços, listas de participantes),
+# sempre uns poucos bytes, então uma fila pequena já sobra.
+SEND_QUEUE_MAX = 32
 
 # Segundos sem NADA chegando = conexão morta. O servidor manda um "ping" a
 # cada 10s, então 45s de silêncio significa que ela caiu de verdade.
@@ -264,12 +259,10 @@ class SignalRClient:
         self._running = False
         self._reader_thread = None
         self._writer_thread = None
-        self._outbox = queue.Queue(maxsize=SEND_QUEUE_MAX)          # controle + áudio
-        self._video_outbox = queue.Queue(maxsize=VIDEO_QUEUE_MAX)   # só vídeo
+        self._outbox = queue.Queue(maxsize=SEND_QUEUE_MAX)
         self._wakeup = threading.Event()
         self._connected = threading.Event()
         self._stop_event = threading.Event()
-        self.dropped_video = 0
         self.dropped_messages = 0
 
     # ---------- ciclo de vida ----------
@@ -398,12 +391,11 @@ class SignalRClient:
         return token
 
     def _drain_outbox(self):
-        for q in (self._outbox, self._video_outbox):
-            while True:
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+        while True:
+            try:
+                self._outbox.get_nowait()
+            except queue.Empty:
+                break
 
     # ---------- entrada ----------
 
@@ -436,20 +428,15 @@ class SignalRClient:
         elif t == MSG_PING:
             # Responder ao ping é o que prova pro servidor que ainda estamos
             # vivos. Sem isso ele nos desconecta por tempo esgotado.
-            self._enqueue({"type": MSG_PING}, "control")
+            self._enqueue({"type": MSG_PING})
         elif t == MSG_CLOSE:
             self.on_state("servidor encerrou a conexão")
 
     # ---------- saída ----------
 
     def _next_payload(self):
-        """Áudio e controle primeiro; vídeo só quando não há mais nada urgente."""
         try:
             return self._outbox.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            return self._video_outbox.get_nowait()
         except queue.Empty:
             return None
 
@@ -469,37 +456,17 @@ class SignalRClient:
                 # A thread de leitura percebe a queda e reconecta sozinha.
                 pass
 
-    def _enqueue(self, obj, kind):
-        """kind: 'control' (nunca some), 'audio' ou 'video' (descartáveis)."""
+    def _enqueue(self, obj):
         if not self._connected.is_set():
             return
         payload = json.dumps(obj, separators=(",", ":")).encode() + SEP
-
-        if kind == "video":
-            try:
-                self._video_outbox.put_nowait(payload)
-            except queue.Full:
-                # Fila de vídeo cheia = a rede não está dando conta. Troca o
-                # quadro mais VELHO pelo mais novo: melhor pular no tempo do
-                # que mostrar o passado.
-                self.dropped_video += 1
-                try:
-                    self._video_outbox.get_nowait()
-                    self._video_outbox.put_nowait(payload)
-                except Exception:
-                    pass
-            self._wakeup.set()
-            return
 
         try:
             self._outbox.put_nowait(payload)
         except queue.Full:
             self.dropped_messages += 1
-            if kind != "control":
-                self._wakeup.set()
-                return
-            # Mensagem de controle não pode sumir: abre espaço jogando fora a
-            # mais antiga (que, na prática, é um pedaço de áudio).
+            # Mensagem de sinalização não pode sumir: abre espaço jogando
+            # fora a mais antiga.
             try:
                 self._outbox.get_nowait()
                 self._outbox.put_nowait(payload)
@@ -512,13 +479,12 @@ class SignalRClient:
         Chama um método no servidor. Vetores de bytes viram base64, porque é
         assim que o protocolo JSON do SignalR os representa — mandar a lista
         de números crua faz o servidor recusar a mensagem.
-        """
-        self._enqueue(self._message(method, args), "control")
 
-    def invoke_media(self, method, *args):
-        """Igual ao invoke, mas pode ser descartado se a rede não acompanhar."""
-        kind = "video" if method == "SendScreenFrame" else "audio"
-        self._enqueue(self._message(method, args), kind)
+        NÃO existe (e não deve voltar a existir) um invoke_media() aqui.
+        Vídeo e áudio vão só pelo caminho direto (ver vysor/peer.py) — o
+        servidor não tem mais nenhum método capaz de repassar mídia.
+        """
+        self._enqueue(self._message(method, args))
 
     @staticmethod
     def _message(method, args):
@@ -527,15 +493,3 @@ class SignalRClient:
             for a in args
         ]
         return {"type": MSG_INVOCATION, "target": method, "arguments": converted}
-
-
-def decode_bytes(value) -> bytes:
-    """Converte de volta um vetor de bytes que chegou como texto base64."""
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    if isinstance(value, str):
-        try:
-            return base64.b64decode(value)
-        except Exception:
-            return b""
-    return b""

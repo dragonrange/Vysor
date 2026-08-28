@@ -696,10 +696,18 @@
 
                                                 <Border Grid.ColumnSpan="2" Background="{Binding RowBackground}" CornerRadius="8"/>
 
-                                                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
-                                                    <TextBlock Text="{Binding DisplayName}" Foreground="White" FontWeight="Bold" FontSize="13" Opacity="{Binding Opacity}"/>
-                                                    <TextBlock Text="👁" Margin="6,0,0,0" VerticalAlignment="Center"
-                                                               Visibility="{Binding WatchIndicatorVisible, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                                <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="10,0,0,0">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <TextBlock Text="{Binding DisplayName}" Foreground="White" FontWeight="Bold" FontSize="13" Opacity="{Binding Opacity}"/>
+                                                        <TextBlock Text="👁" Margin="6,0,0,0" VerticalAlignment="Center"
+                                                                   Visibility="{Binding WatchIndicatorVisible, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                                                    </StackPanel>
+                                                    <!-- Sem servidor de repasse, se o caminho direto não fechar o
+                                                         vídeo dessa pessoa nunca chega — esta linha é o que explica
+                                                         por quê, em vez de deixar a tela preta sem nenhuma pista. -->
+                                                    <TextBlock Text="{Binding LinkStatusText}" FontSize="10"
+                                                               Foreground="{Binding LinkStatusColor}"
+                                                               Visibility="{Binding LinkStatusVisible, Converter={StaticResource BoolToVisibilityConverter}}"/>
                                                 </StackPanel>
 
                                                 <!-- Botão de play: cinza/desligado até a pessoa começar a transmitir,

@@ -3,24 +3,22 @@ using System.Net;
 
 namespace VysorClient.Services;
 
-// Decide, PARA CADA AMIGO, por onde o vídeo vai: direto ou pelo servidor.
+// Decide, PARA CADA AMIGO, se o vídeo vai — e o vídeo SÓ vai direto.
 //
 // O QUE MUDOU E POR QUÊ
 // Antes, cada quadro que você transmitia subia pro servidor e descia pra cada
-// pessoa. Isso funcionava, mas era o servidor pagando a conta — e foi o que
-// esgotou o plano grátis duas vezes. Agora o vídeo vai direto do seu PC pro
-// PC de cada amigo, e o servidor só apresenta um ao outro.
+// pessoa. Depois, ganhou um "caminho de reserva": se o furo de NAT não
+// fechasse pra um par específico, o vídeo DAQUELE par voltava a passar pelo
+// servidor. Essa reserva parecia inofensiva ("só a exceção"), mas foi
+// exatamente o que estourou o plano grátis do Render de novo: o app Android
+// nunca soube descobrir o próprio endereço externo, então toda sessão em que
+// o celular não estivesse na mesma rede local do PC caía nessa "exceção" e
+// ficava nela a sessão inteira.
 //
-// A REGRA, POR PESSOA E NÃO PELO GRUPO
-// O caminho direto não fecha em 100% dos casos: às vezes um par específico
-// não consegue, mesmo com todo o resto funcionando. Por isso a decisão é
-// individual — o amigo com quem o caminho direto fechou recebe direto; o
-// outro continua recebendo pelo servidor, sem perceber diferença. Ninguém
-// fica sem ver ninguém por causa de uma rede teimosa.
-//
-// Enquanto o caminho direto está sendo negociado (leva menos de um segundo),
-// tudo vai pelo servidor. Assim a transmissão começa na hora e vai migrando
-// sozinha, em vez de ficar esperando parada.
+// A regra agora é sem exceção nenhuma: se o caminho direto não existir pra um
+// amigo, o quadro é DESCARTADO. O servidor não tem mais nenhum método capaz
+// de carregar vídeo/áudio (ver RoomHub.cs) — não é uma escolha do cliente que
+// dá pra reverter sozinha, é estrutural.
 public class PeerMedia
 {
     private readonly SignalRService _signalR;
@@ -31,9 +29,8 @@ public class PeerMedia
     // quem já anunciou endereço; esta lista conhece todo mundo.
     private readonly ConcurrentDictionary<string, byte> _participants = new();
 
-    // Chegou vídeo/áudio de alguém — não importa se veio direto ou pelo
-    // servidor. Quem escuta trata igual, e é isso que faz os dois caminhos
-    // conviverem sem o resto do app precisar saber.
+    // Chegou vídeo/áudio de alguém pelo caminho direto — é o único caminho
+    // que existe agora.
     public event Action<string, byte[]>? OnVideo;
     public event Action<string, byte[]>? OnAudio;
 
@@ -66,11 +63,14 @@ public class PeerMedia
         var transport = new PeerTransport(_signalR.UserId, PeerPacket.DeriveKey(roomCode));
         transport.OnFrame += HandleDirectFrame;
         transport.OnPeerStateChanged += (_, _) => OnPathsChanged?.Invoke();
+        transport.OnSameNetworkStuck += userId => OnSameNetworkStuck?.Invoke(userId);
 
         if (!transport.Start())
         {
-            // Não conseguiu abrir o canal direto: tudo continua pelo servidor,
-            // exatamente como funcionava antes. Nada quebra.
+            // Não conseguiu nem abrir o socket UDP local (raríssimo — falta
+            // de permissão, firewall agressivo). Sem servidor de reserva pra
+            // cair, isso significa que este PC não vai conseguir mandar nem
+            // receber vídeo/áudio de ninguém nesta sessão.
             return;
         }
 
@@ -165,7 +165,8 @@ public class PeerMedia
         }
         catch
         {
-            // Sem endereço anunciado, tudo continua indo pelo servidor.
+            // Sem endereço anunciado, ninguém consegue achar este PC — os
+            // amigos ficam esperando o caminho direto fechar.
         }
     }
 
@@ -243,24 +244,32 @@ public class PeerMedia
     public void SendVideo(byte[] taggedFrame) => Send(PeerPacket.KindVideo, taggedFrame);
     public void SendAudio(byte[] chunk) => Send(PeerPacket.KindAudio, chunk);
 
+    // Sem servidor de repasse: se o caminho direto com esse amigo ainda não
+    // fechou, o quadro é descartado ali mesmo. Nunca mais passa pelo
+    // servidor — nem vídeo, nem áudio, nem "só esse par".
     private void Send(byte kind, byte[] payload)
     {
+        if (_transport == null) return;
+
         foreach (string userId in _participants.Keys)
         {
-            if (_transport != null && _transport.IsConnected(userId))
+            if (_transport.IsConnected(userId))
             {
                 _transport.Send(userId, kind, payload);
             }
-            else if (kind == PeerPacket.KindVideo)
-            {
-                _ = _signalR.SendFrameToAsync(userId, payload);
-            }
-            else
-            {
-                _ = _signalR.SendAudioChunkToAsync(userId, payload);
-            }
         }
     }
+
+    // Mesma rede que este amigo (mesmo /24 em algum dos endereços locais dos
+    // dois lados)? Serve pra UI explicar melhor quando o caminho direto
+    // demora: "vocês estão na mesma rede" descarta de cara a explicação mais
+    // comum (internet ruim) e aponta pra outra (isolamento de cliente/AP no
+    // roteador).
+    public bool IsSameNetwork(string userId) => _transport?.IsSameNetworkHint(userId) == true;
+
+    // Amigo na mesma rede, mas o caminho direto não fechou depois de um tempo
+    // razoável. Ver PeerTransport.SameNetworkStuckAfter — dispara uma vez só.
+    public event Action<string>? OnSameNetworkStuck;
 
     private void HandleDirectFrame(string userId, byte kind, byte[] payload)
     {
