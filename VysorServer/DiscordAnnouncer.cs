@@ -67,16 +67,85 @@ public class DiscordAnnouncer
 
     // Posta o convite. Devolve false quando não fez nada — é esse false que
     // manda o app usar o caminho antigo.
+    // Lista os canais de texto de um servidor, pra pessoa poder CLICAR num em
+    // vez de descobrir e digitar um número de canal (o que exigiria ligar o
+    // "modo desenvolvedor" do Discord — passo em que quase todo mundo desiste).
+    public async Task<List<(string Id, string Name)>> ListTextChannelsAsync(string? guildId)
+    {
+        var result = new List<(string, string)>();
+
+        if (string.IsNullOrWhiteSpace(_token)) return result;
+        guildId = Clean(guildId, 25);
+        if (guildId.Length == 0 || !guildId.All(char.IsDigit)) return result;
+
+        try
+        {
+            var response = await _http.GetAsync($"https://discord.com/api/v10/guilds/{guildId}/channels");
+            if (!response.IsSuccessStatusCode)
+            {
+                _log.LogWarning("Discord recusou listar canais: {Status}", response.StatusCode);
+                return result;
+            }
+
+            using var doc = System.Text.Json.JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                // 0 = canal de texto comum. Os outros (voz, categoria, fórum)
+                // não recebem mensagem simples e só confundiriam a escolha.
+                if (!item.TryGetProperty("type", out var type) || type.GetInt32() != 0) continue;
+                if (!item.TryGetProperty("id", out var id)) continue;
+                if (!item.TryGetProperty("name", out var name)) continue;
+
+                result.Add((id.GetString() ?? "", name.GetString() ?? ""));
+                if (result.Count >= 50) break;   // servidores grandes: não vira uma parede
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Falha ao listar canais");
+        }
+
+        return result;
+    }
+
+    // Anuncia num canal ESCOLHIDO por quem criou a sala. É o que permite cada
+    // pessoa avisar o servidor dela, em vez de existir um único canal fixo pro
+    // mundo inteiro.
+    //
+    // O canal vem do app, e isso é aceitável: o bot só está em servidores onde
+    // um administrador o instalou, então o alcance disto é exatamente o
+    // conjunto de servidores que já aceitaram o Vysor. E o TEXTO da mensagem é
+    // montado aqui — o app não escolhe o que é dito, só para onde vai.
+    public async Task<bool> AnnounceRoomAsync(string roomCode, string displayName, string? channelId)
+    {
+        channelId = Clean(channelId, 25);
+        if (channelId.Length == 0 || !channelId.All(char.IsDigit)) return false;
+        return await PostAsync(roomCode, displayName, channelId);
+    }
+
+    // Canal fixo do servidor (variável de ambiente). Continua existindo como
+    // reserva pra quem ainda não escolheu canal nenhum.
     public async Task<bool> AnnounceRoomAsync(string roomCode, string displayName)
     {
         if (!IsConfigured) return false;
+        return await PostAsync(roomCode, displayName, _channelId!.Trim());
+    }
+
+    private async Task<bool> PostAsync(string roomCode, string displayName, string channelId)
+    {
+        if (string.IsNullOrWhiteSpace(_token)) return false;
 
         roomCode = Clean(roomCode, 12);
         if (roomCode.Length == 0) return false;
 
+        // A trava de repetição é por SALA + CANAL: a mesma sala anunciada em
+        // dois canais diferentes são dois avisos legítimos, enquanto a mesma
+        // sala no mesmo canal (o que acontece numa reconexão) é repetição.
+        string key = $"{roomCode}@{channelId}";
+
         lock (_lock)
         {
-            if (!_announced.Add(roomCode)) return true;   // já anunciada: nada a fazer
+            if (!_announced.Add(key)) return true;   // já anunciada: nada a fazer
 
             // Trava de memória: o servidor é de graça e vive de RAM. Uma sala
             // só volta a poder ser anunciada depois disso, o que é
@@ -102,7 +171,7 @@ public class DiscordAnnouncer
 
             using var body = new StringContent(json, Encoding.UTF8, "application/json");
             var response = await _http.PostAsync(
-                $"https://discord.com/api/v10/channels/{_channelId!.Trim()}/messages", body);
+                $"https://discord.com/api/v10/channels/{channelId}/messages", body);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -114,7 +183,7 @@ public class DiscordAnnouncer
 
                 // Deixa a sala poder ser anunciada de novo numa próxima
                 // tentativa, em vez de marcá-la como feita.
-                lock (_lock) { _announced.Remove(roomCode); }
+                lock (_lock) { _announced.Remove(key); }
                 return false;
             }
 
@@ -123,7 +192,7 @@ public class DiscordAnnouncer
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Falha ao avisar o Discord");
-            lock (_lock) { _announced.Remove(roomCode); }
+            lock (_lock) { _announced.Remove(key); }
             return false;
         }
     }

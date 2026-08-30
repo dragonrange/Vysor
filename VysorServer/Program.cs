@@ -143,6 +143,67 @@ app.MapGet("/j/{code}", (string code) =>
     return Results.Content(html, "text/html; charset=utf-8");
 });
 
+// ---- Páginas exigidas pra verificação do app no Discord ----
+//
+// O Discord exige um link de termos e um de privacidade pra verificar um
+// aplicativo. Ficam aqui porque este servidor já existe e já é o endereço
+// público do Vysor — criar um site à parte só pra duas páginas seria mais uma
+// coisa pra manter e pra expirar.
+//
+// O conteúdo é verdadeiro e específico, não um modelo genérico: descreve o que
+// este servidor realmente faz e o que ele realmente guarda. Um texto de
+// privacidade que não corresponde ao programa é pior do que nenhum.
+app.MapGet("/termos", () => Results.Content(LegalPages.Terms, "text/html; charset=utf-8"));
+app.MapGet("/privacidade", () => Results.Content(LegalPages.Privacy, "text/html; charset=utf-8"));
+
+// ---- Depois de instalar o Vysor num servidor do Discord ----
+//
+// O Discord manda a pessoa pra cá assim que ela autoriza, com o identificador
+// do servidor escolhido. Aqui perguntamos ao Discord quais canais existem lá e
+// deixamos ela CLICAR num — em vez de pedir que descubra e digite um número de
+// canal, que exigiria ligar o "modo desenvolvedor" e é onde quase todo mundo
+// desiste.
+//
+// A escolha volta pro app pelo mesmo "vysor://" que já usamos pros convites.
+app.MapGet("/discord/instalado", async (HttpContext ctx, DiscordAnnouncer discord) =>
+{
+    string guildId = ctx.Request.Query["guild_id"].ToString();
+    var channels = await discord.ListTextChannelsAsync(guildId);
+
+    string body;
+    if (channels.Count == 0)
+    {
+        body = """
+          <h2>Quase lá</h2>
+          <p>O Vysor foi adicionado, mas não consegui ver os canais deste servidor.
+             Confira se ele tem permissão de <b>Ver canais</b> e
+             <b>Enviar mensagens</b>, e abra este endereço de novo.</p>
+        """;
+    }
+    else
+    {
+        var list = new System.Text.StringBuilder();
+        foreach (var (id, name) in channels)
+        {
+            // Nome em base64url: nome de canal aceita caracteres que
+            // estragariam o formato do link de volta.
+            string encoded = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(name))
+                .Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+            list.Append($"<a class=\"ch\" href=\"vysor://canal/{id}/{encoded}\">#{System.Net.WebUtility.HtmlEncode(name)}</a>");
+        }
+
+        body = $"""
+          <h2>Em qual canal avisar?</h2>
+          <p>Quando você abrir uma sala no Vysor, o convite vai pra este canal.</p>
+          <div class="list">{list}</div>
+          <p class="small">Escolha um e o Vysor guarda sozinho. Dá pra trocar depois.</p>
+        """;
+    }
+
+    return Results.Content(LegalPages.Shell("Escolher canal — Vysor", body), "text/html; charset=utf-8");
+});
+
 // Aqui é onde os clientes (o app Vysor dos seus amigos) vão se conectar.
 app.MapHub<RoomHub>("/roomhub", options =>
 {

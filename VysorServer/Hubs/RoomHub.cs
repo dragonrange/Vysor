@@ -34,7 +34,10 @@ public class RoomHub : Hub
     //
     // Devolve false quando o bot não está configurado — e é esse false que faz
     // o app cair sozinho no caminho antigo (webhook embutido no cliente).
-    public async Task<bool> AnnounceRoomOnDiscord(string displayName)
+    // channelId é o canal que ESTA pessoa escolheu ao instalar o Vysor no
+    // servidor dela (ver /discord/instalado). Vazio = usa o canal fixo do
+    // servidor, se houver — é o que atende quem nunca configurou nada.
+    public async Task<bool> AnnounceRoomOnDiscord(string displayName, string? channelId)
     {
         var info = _roomManager.GetConnectionInfo(Context.ConnectionId);
         if (info == null) return false;
@@ -42,7 +45,9 @@ public class RoomHub : Hub
         var room = _roomManager.GetRoom(info.RoomCode);
         if (room == null) return false;
 
-        return await _discord.AnnounceRoomAsync(room.Code, displayName);
+        return string.IsNullOrWhiteSpace(channelId)
+            ? await _discord.AnnounceRoomAsync(room.Code, displayName)
+            : await _discord.AnnounceRoomAsync(room.Code, displayName, channelId);
     }
 
     // Tira a conexão da sala em que ela está. Usado quando a pessoa entra em
