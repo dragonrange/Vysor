@@ -82,7 +82,20 @@ jobs:
       - name: Montar o instalador
         shell: pwsh
         run: |
-          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" VysorClient/installer/Vysor.iss
+          # As CHAVES em ${env:...} são obrigatórias aqui: sem elas o PowerShell
+          # encerra o nome da variável no parêntese e monta
+          # "C:\Program Files(x86)\..." — sem o espaço, um caminho que não
+          # existe. Procurar o ISCC em vez de fixar o caminho evita de vez essa
+          # classe de erro, e aguenta o Inno Setup mudar de lugar.
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) { throw 'Não achei o ISCC.exe do Inno Setup' }
+          Write-Host "Inno Setup: $iscc"
+
+          & $iscc VysorClient/installer/Vysor.iss
           if (-not (Test-Path VysorClient/installer/Output/VysorSetup.exe)) { throw 'O instalador não foi gerado' }
 
       # Versão que não precisa instalar. Existe para quem é bloqueado pelo
