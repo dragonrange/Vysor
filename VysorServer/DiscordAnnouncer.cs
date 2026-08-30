@@ -141,6 +141,74 @@ public class DiscordAnnouncer
               "Confira se o cargo Vysor tem a permissão Ver canais.");
     }
 
+    // "O aviso no Discord vai funcionar quando eu criar uma sala?"
+    //
+    // POR QUE PERGUNTAR ANTES
+    // Todas as formas de isto parar de funcionar são silenciosas: alguém remove
+    // o Vysor do servidor, o token é regerado, o bot entra num segundo servidor
+    // e a descoberta automática passa a desistir. Em nenhum desses casos o app
+    // fica sabendo — ele só descobriria ao criar uma sala, tarde demais, e
+    // antes nem isso: engolia o resultado.
+    //
+    // Perguntando quando o app abre, o estado aparece na tela inicial enquanto
+    // ainda dá tempo de arrumar.
+    //
+    // Devolve "ok|nome-do-canal" ou "erro|explicação em português".
+    public async Task<string> CheckAsync(string? channelId)
+    {
+        if (string.IsNullOrWhiteSpace(_token))
+            return "erro|O servidor do Vysor está sem o token do bot.";
+
+        try
+        {
+            string? id = Clean(channelId, 25);
+            if (id.Length == 0 || !id.All(char.IsDigit))
+            {
+                // Sem canal escolhido: confere o mesmo caminho que seria usado
+                // de verdade (variável fixa, senão descoberta automática).
+                id = !string.IsNullOrWhiteSpace(_channelId)
+                    ? _channelId!.Trim()
+                    : await DiscoverMainChannelAsync();
+
+                if (string.IsNullOrWhiteSpace(id))
+                    return "erro|O Vysor não está instalado em nenhum servidor do Discord, " +
+                           "ou está em vários e não dá pra saber em qual avisar.";
+            }
+
+            var response = await _http.GetAsync($"https://discord.com/api/v10/channels/{id}");
+            if (response.IsSuccessStatusCode)
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(
+                    await response.Content.ReadAsStringAsync());
+
+                string name = doc.RootElement.TryGetProperty("name", out var n)
+                    ? n.GetString() ?? "canal" : "canal";
+                return $"ok|{name}";
+            }
+
+            // Um canal que some é quase sempre o Vysor tendo sido removido do
+            // servidor — vale dizer isso, e não só o número do erro.
+            string detail = (int)response.StatusCode switch
+            {
+                401 => "o token do bot está inválido — foi regerado?",
+                403 => "o Vysor perdeu a permissão de ver esse canal",
+                404 => "o Vysor não está mais nesse servidor, ou o canal foi apagado",
+                _   => $"o Discord respondeu {(int)response.StatusCode}"
+            };
+
+            // A escolha guardada não vale mais: esquecer aqui faz a próxima
+            // checagem tentar a descoberta automática de novo, em vez de
+            // insistir para sempre num canal que morreu.
+            _discoveredChannel = null;
+            return $"erro|{detail}";
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Falha ao checar o estado do Discord");
+            return "erro|Não consegui falar com o Discord agora.";
+        }
+    }
+
     // Anuncia num canal ESCOLHIDO por quem criou a sala. É o que permite cada
     // pessoa avisar o servidor dela, em vez de existir um único canal fixo pro
     // mundo inteiro.

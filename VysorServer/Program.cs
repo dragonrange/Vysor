@@ -156,6 +156,17 @@ app.MapGet("/j/{code}", (string code) =>
 app.MapGet("/termos", () => Results.Content(LegalPages.Terms, "text/html; charset=utf-8"));
 app.MapGet("/privacidade", () => Results.Content(LegalPages.Privacy, "text/html; charset=utf-8"));
 
+// Estado da integração com o Discord, consultado pelo app quando ele abre.
+//
+// Rota HTTP simples de propósito: o app NÃO abre conexão com o servidor
+// enquanto está na tela inicial (só ao criar/entrar numa sala), e obrigá-lo a
+// abrir só pra isso seria caro. De quebra, esta chamada ACORDA o servidor —
+// então criar a sala logo depois já pega tudo de pé, sem a espera do plano
+// grátis.
+app.MapGet("/discord/estado", async (HttpContext ctx, DiscordAnnouncer discord) =>
+    Results.Text(await discord.CheckAsync(ctx.Request.Query["canal"].ToString()),
+                 "text/plain; charset=utf-8"));
+
 // ---- Depois de instalar o Vysor num servidor do Discord ----
 //
 // O Discord manda a pessoa pra cá assim que ela autoriza, com o identificador
