@@ -13,10 +13,36 @@ public class RoomHub : Hub
     // descartado; o IHubContext é global e vale a qualquer momento.
     private readonly IHubContext<RoomHub> _hubContext;
 
-    public RoomHub(RoomManager roomManager, IHubContext<RoomHub> hubContext)
+    private readonly DiscordAnnouncer _discord;
+
+    public RoomHub(RoomManager roomManager, IHubContext<RoomHub> hubContext, DiscordAnnouncer discord)
     {
         _roomManager = roomManager;
         _hubContext = hubContext;
+        _discord = discord;
+    }
+
+    // Pede pro servidor avisar o canal do Discord que esta sala existe.
+    //
+    // POR QUE PASSA POR AQUI E NÃO POR UMA ROTA HTTP SOLTA
+    // Uma rota aberta do tipo "/anunciar?codigo=X" deixaria QUALQUER UM na
+    // internet publicar no canal à vontade, só chutando endereços — o canal
+    // viraria mural de spam de estranhos. Aqui não: o servidor não acredita no
+    // que o cliente diz. Ele olha em qual sala esta conexão está de verdade
+    // (ver TrackConnection) e só anuncia essa. Quem não está numa sala não
+    // consegue anunciar nada.
+    //
+    // Devolve false quando o bot não está configurado — e é esse false que faz
+    // o app cair sozinho no caminho antigo (webhook embutido no cliente).
+    public async Task<bool> AnnounceRoomOnDiscord(string displayName)
+    {
+        var info = _roomManager.GetConnectionInfo(Context.ConnectionId);
+        if (info == null) return false;
+
+        var room = _roomManager.GetRoom(info.RoomCode);
+        if (room == null) return false;
+
+        return await _discord.AnnounceRoomAsync(room.Code, displayName);
     }
 
     // Tira a conexão da sala em que ela está. Usado quando a pessoa entra em

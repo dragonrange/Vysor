@@ -36,6 +36,12 @@ builder.Services.AddSignalR(options =>
 // compartilhada por todas as conexões, viva enquanto o servidor rodar).
 builder.Services.AddSingleton<RoomManager>();
 
+// Aviso no Discord (ver DiscordAnnouncer.cs). Fica INERTE sem as variáveis de
+// ambiente DISCORD_BOT_TOKEN e DISCORD_CHANNEL_ID — e é justamente isso que
+// permite desfazer sem publicar nada: apagou as variáveis, o app volta sozinho
+// pro caminho antigo.
+builder.Services.AddSingleton<DiscordAnnouncer>();
+
 // Faxina periódica: remove quem caiu e não voltou dentro do prazo (avisando
 // os outros só nesse momento) e apaga salas vazias antigas.
 builder.Services.AddHostedService<RoomSweeper>();
