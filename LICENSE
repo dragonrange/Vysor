@@ -19,10 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-O Vysor distribui junto o ffmpeg (ffmpeg.exe), que NÃO é coberto por esta
-licença. O ffmpeg é um programa separado, com licença própria (LGPL/GPL,
-conforme a compilação usada), executado pelo Vysor como processo externo.
-Detalhes e código-fonte: https://ffmpeg.org
