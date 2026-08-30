@@ -57,13 +57,15 @@ public class DiscordAnnouncer
 
     // ESTE É O INTERRUPTOR DE VOLTA.
     //
-    // Sem as duas variáveis de ambiente, o bot não existe: o servidor responde
-    // "não anunciei" e o app cai sozinho no caminho antigo (o webhook embutido
-    // — ver DiscordWebhook no cliente). Ou seja, desfazer é APAGAR DUAS
-    // VARIÁVEIS no painel do Render; ninguém precisa atualizar nada, e não sai
-    // versão nova do app.
-    public bool IsConfigured =>
-        !string.IsNullOrWhiteSpace(_token) && !string.IsNullOrWhiteSpace(_channelId);
+    // Sem o token, o recurso inteiro não existe: o servidor responde "não
+    // anunciei" e nada é publicado. Desfazer é APAGAR UMA VARIÁVEL no painel do
+    // Render; ninguém precisa atualizar nada e não sai versão nova do app.
+    //
+    // O canal NÃO entra nesta conta de propósito: ele pode vir de três lugares
+    // (escolha da pessoa, variável de ambiente, ou descoberto sozinho — ver
+    // AnnounceRoomAsync), então exigir a variável aqui desligaria o recurso
+    // justamente pra quem depende da descoberta automática.
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(_token);
 
     // Posta o convite. Devolve false quando não fez nada — é esse false que
     // manda o app usar o caminho antigo.
@@ -154,12 +156,100 @@ public class DiscordAnnouncer
         return await PostAsync(roomCode, displayName, channelId);
     }
 
-    // Canal fixo do servidor (variável de ambiente). Continua existindo como
-    // reserva pra quem ainda não escolheu canal nenhum.
+    // Sem canal escolhido: descobre sozinho pra onde mandar.
+    //
+    // POR QUE ISTO EXISTE
+    // Só quem ADMINISTRA um servidor do Discord consegue instalar o Vysor nele
+    // e escolher um canal. Um membro comum clicava no botão, via uma lista
+    // vazia de servidores e ficava sem aviso nenhum — mesmo estando no mesmo
+    // grupo, no mesmo canal de voz, com o bot instalado ali do lado.
+    //
+    // A ORDEM DE PREFERÊNCIA, do mais explícito pro mais automático:
+    //   1. O canal que a pessoa escolheu, se escolheu.
+    //   2. DISCORD_CHANNEL_ID, se quem cuida do servidor fixou um.
+    //   3. Descoberto: se o bot está em UM servidor só, não há ambiguidade —
+    //      usamos o canal de sistema dele (o "chat principal", onde caem os
+    //      avisos de quem entrou) ou, na falta, o primeiro canal de texto.
+    //
+    // O caso 3 é o que faz funcionar pra quem não é admin, sem configuração
+    // nenhuma. Com o bot em vários servidores, ele não chuta: aí é preciso
+    // dizer qual, pelos casos 1 ou 2.
     public async Task<bool> AnnounceRoomAsync(string roomCode, string displayName)
     {
-        if (!IsConfigured) return false;
-        return await PostAsync(roomCode, displayName, _channelId!.Trim());
+        if (string.IsNullOrWhiteSpace(_token)) return false;
+
+        string? channel = !string.IsNullOrWhiteSpace(_channelId)
+            ? _channelId!.Trim()
+            : await DiscoverMainChannelAsync();
+
+        if (string.IsNullOrWhiteSpace(channel)) return false;
+        return await PostAsync(roomCode, displayName, channel!);
+    }
+
+    // Guardado depois de descoberto: são duas chamadas ao Discord e a resposta
+    // não muda. Sem isto, toda sala criada custaria essas duas idas a mais.
+    private string? _discoveredChannel;
+
+    private async Task<string?> DiscoverMainChannelAsync()
+    {
+        if (_discoveredChannel != null) return _discoveredChannel;
+
+        try
+        {
+            var guildsResponse = await _http.GetAsync("https://discord.com/api/v10/users/@me/guilds");
+            if (!guildsResponse.IsSuccessStatusCode) return null;
+
+            using var guilds = System.Text.Json.JsonDocument.Parse(
+                await guildsResponse.Content.ReadAsStringAsync());
+
+            var ids = new List<string>();
+            foreach (var g in guilds.RootElement.EnumerateArray())
+                if (g.TryGetProperty("id", out var gid)) ids.Add(gid.GetString() ?? "");
+
+            // Em mais de um servidor, adivinhar seria pior que não fazer nada:
+            // a sala de um grupo apareceria no canal de outro.
+            if (ids.Count != 1) return null;
+
+            string guildId = ids[0];
+
+            // O "canal de sistema" é onde o Discord põe os avisos de quem
+            // entrou no servidor — na prática, o chat principal. É a melhor
+            // aposta pro convite ser visto por todo mundo.
+            var guildResponse = await _http.GetAsync($"https://discord.com/api/v10/guilds/{guildId}");
+            if (guildResponse.IsSuccessStatusCode)
+            {
+                using var guild = System.Text.Json.JsonDocument.Parse(
+                    await guildResponse.Content.ReadAsStringAsync());
+
+                if (guild.RootElement.TryGetProperty("system_channel_id", out var sys) &&
+                    sys.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    string? id = sys.GetString();
+                    if (!string.IsNullOrWhiteSpace(id))
+                    {
+                        _discoveredChannel = id;
+                        _log.LogInformation("Canal descoberto pelo canal de sistema: {Channel}", id);
+                        return id;
+                    }
+                }
+            }
+
+            // Servidor sem canal de sistema definido: fica o primeiro canal de
+            // texto que o bot enxerga.
+            var list = await ListTextChannelsAsync(guildId);
+            if (list.Channels.Count > 0)
+            {
+                _discoveredChannel = list.Channels[0].Id;
+                _log.LogInformation("Canal descoberto pelo primeiro de texto: {Channel}", _discoveredChannel);
+                return _discoveredChannel;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Falha ao descobrir o canal principal");
+        }
+
+        return null;
     }
 
     private async Task<bool> PostAsync(string roomCode, string displayName, string channelId)
