@@ -37,6 +37,10 @@ public class PeerMedia
     // Mudou quantos amigos estão no caminho direto (pra tela poder mostrar).
     public event Action? OnPathsChanged;
 
+    // Perdemos um quadro de vídeo desta pessoa. Quem assiste precisa mandar o
+    // decodificador ressincronizar — ver PeerTransport.OnVideoLoss.
+    public event Action<string>? OnVideoLoss;
+
     public PeerMedia(SignalRService signalR)
     {
         _signalR = signalR;
@@ -48,6 +52,11 @@ public class PeerMedia
     public int TotalPeers => _participants.Count;
 
     public bool IsDirect(string userId) => _transport?.IsConnected(userId) == true;
+
+    // Repassa os números de diagnóstico do transporte (ver PeerTransport).
+    public long SendQueueDrops => _transport?.DroppedFrames ?? 0;
+    public long ReassemblyLosses => _transport?.ReassemblyLosses ?? 0;
+    public int QueuedVideoPackets => _transport?.QueuedVideoPackets ?? 0;
 
     // ---------- ciclo de vida ----------
 
@@ -64,6 +73,7 @@ public class PeerMedia
         transport.OnFrame += HandleDirectFrame;
         transport.OnPeerStateChanged += (_, _) => OnPathsChanged?.Invoke();
         transport.OnSameNetworkStuck += userId => OnSameNetworkStuck?.Invoke(userId);
+        transport.OnVideoLoss += userId => OnVideoLoss?.Invoke(userId);
 
         if (!transport.Start())
         {

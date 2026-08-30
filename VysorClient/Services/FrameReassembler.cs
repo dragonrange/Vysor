@@ -21,7 +21,13 @@ public class FrameReassembler
 
     // Quadro cujo primeiro pedaço chegou há mais que isto está perdido: numa
     // transmissão ao vivo, esperar mais que isso não tem sentido.
-    private static readonly TimeSpan MaxAge = TimeSpan.FromSeconds(2);
+    //
+    // Eram 2 segundos, e isso era tempo demais pra vídeo ao vivo: um quadro
+    // com pedaço faltando ficava 2s ocupando vaga E, o que era pior, só
+    // avisava da perda 2s depois — quando o estrago na imagem já tinha
+    // acontecido inteiro. Meio segundo é mais que suficiente (os pedaços de
+    // um quadro saem juntos, então ou chegam em milissegundos ou não chegam).
+    private static readonly TimeSpan MaxAge = TimeSpan.FromMilliseconds(500);
 
     private sealed class Pending
     {
@@ -49,6 +55,35 @@ public class FrameReassembler
 
     public int PendingCount => _pending.Count;
     public long DroppedFrames { get; private set; }
+
+    // Algum quadro foi dado como perdido desde a última vez que perguntaram?
+    //
+    // POR QUE ISSO IMPORTA (e por que só contar não bastava)
+    // Vídeo H.264 é uma corrente: cada quadro comum descreve as DIFERENÇAS em
+    // relação ao anterior. Perder um quadro no meio e continuar entregando os
+    // seguintes ao decodificador não gera "um quadro a menos" — gera imagem
+    // ERRADA daí em diante, com pedaços do quadro velho grudados nos novos,
+    // até o próximo quadro-chave. É exatamente o "parece que o frame anterior
+    // está mesclando com os próximos" que aparecia na tela.
+    //
+    // Quem consome este aviso (ver PeerTransport.OnVideoLoss) manda o
+    // decodificador parar e esperar o próximo quadro-chave, em vez de
+    // alimentá-lo com uma corrente quebrada. Como o quadro-chave vem a cada
+    // ~250ms, o preço é uma pausa curta no lugar de meio segundo de borrão.
+    private bool _lostSinceLastCheck;
+
+    public bool TakeLoss()
+    {
+        if (!_lostSinceLastCheck) return false;
+        _lostSinceLastCheck = false;
+        return true;
+    }
+
+    private void CountLoss()
+    {
+        DroppedFrames++;
+        _lostSinceLastCheck = true;
+    }
 
     // Recebe um pacote. Devolve o quadro completo, ou null se ainda falta
     // pedaço (ou se o pacote não presta).
@@ -80,7 +115,7 @@ public class FrameReassembler
         if (pending.Fragments.Length != header.FragCount)
         {
             _pending.Remove(header.FrameId);
-            DroppedFrames++;
+            CountLoss();
             return null;
         }
 
@@ -111,12 +146,40 @@ public class FrameReassembler
         _lastDelivered = header.FrameId;
         _hasDelivered = true;
 
+        // Este quadro completou, então qualquer quadro MAIS ANTIGO que ainda
+        // esteja em montagem já era: os pedaços de um quadro saem todos juntos,
+        // então se um quadro posterior chegou inteiro, os pedaços que faltavam
+        // no anterior não vêm mais.
+        //
+        // Antes esses restos ficavam parados até expirar, e a perda só era
+        // percebida meio segundo depois — tarde demais pra evitar o borrão.
+        // Limpar aqui é o que torna o aviso de perda IMEDIATO.
+        PurgeOlderThanDelivered();
+
         byte[]? frame = PeerPacket.Decrypt(sealed_, _key, header.FrameId, pending.Kind);
-        if (frame == null) DroppedFrames++;
+        if (frame == null) CountLoss();
         return frame;
     }
 
     public byte LastKind { get; private set; }
+
+    private void PurgeOlderThanDelivered()
+    {
+        if (_pending.Count == 0) return;
+
+        List<uint>? stale = null;
+        foreach (var (id, _) in _pending)
+        {
+            if (IsOlderOrEqual(id, _lastDelivered)) (stale ??= new List<uint>()).Add(id);
+        }
+
+        if (stale == null) return;
+        foreach (uint id in stale)
+        {
+            _pending.Remove(id);
+            CountLoss();
+        }
+    }
 
     private void DropExpired()
     {
@@ -133,7 +196,7 @@ public class FrameReassembler
         foreach (uint id in expired)
         {
             _pending.Remove(id);
-            DroppedFrames++;
+            CountLoss();
         }
     }
 
@@ -146,7 +209,7 @@ public class FrameReassembler
             if (pending.FirstSeen < oldestTime) { oldestTime = pending.FirstSeen; oldest = id; }
         }
         _pending.Remove(oldest);
-        DroppedFrames++;
+        CountLoss();
     }
 
     // Comparação que aguenta o contador dar a volta (depois de 4 bilhões de

@@ -88,14 +88,70 @@ Se você estiver usando o `server.txt` (endereço do servidor separado do
 `.exe`) e/ou o `ffmpeg.exe` (Passo 2.5, pra usar a GPU), garanta que os dois
 estão DENTRO da pasta `publish` antes de zipar, pra ir tudo junto.
 
-**B) Um instalador de verdade (opcional)**
+**B) Um instalador de verdade (recomendado a partir de agora)**
 
-Se quiser algo mais "profissional" — ícone na área de trabalho, aparece em
-"Adicionar ou remover programas", etc — dá pra empacotar esse mesmo `.exe`
-com o **Inno Setup** (gratuito: https://jrsoftware.org/isinfo.php). Se você
-quiser, é só me pedir que eu gero o script (`.iss`) do instalador pra você
-usar — mas para simplesmente "seus amigos testarem", a opção A já resolve
-sem complicação extra.
+Existe um instalador pronto em `VysorClient/installer/Vysor.iss`, feito com o
+**Inno Setup** (gratuito: https://jrsoftware.org/isinfo.php). Ele não é só
+"mais profissional" — ele resolve um problema de verdade: agora que o
+vídeo/áudio vão sempre DIRETO entre os PCs (P2P por UDP, nunca mais pelo
+servidor), o Windows Firewall bloqueia por padrão a entrada desse tráfego, e
+cada pessoa que só copiasse o `.exe` "cru" (opção A) precisaria liberar isso
+na mão — foi exatamente isso que fez um teste real não mostrar vídeo nenhum.
+
+O instalador resolve isso configurando a regra de firewall automaticamente
+durante a instalação (que já pede permissão de administrador de qualquer
+jeito). Ninguém precisa mexer em Firewall na mão nunca mais.
+
+Pra gerar:
+
+```powershell
+cd VysorClient\installer
+& "C:\Users\<seu usuário>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" Vysor.iss
+```
+
+(Se o Inno Setup estiver instalado em outro lugar, ou aparecer no Menu
+Iniciar, você também pode simplesmente abrir `Vysor.iss` nele e clicar em
+"Compilar".)
+
+O instalador final sai em `VysorClient/installer/Output/VysorSetup.exe` —
+é ESSE arquivo que você manda pros seus amigos (não precisa zipar nada).
+Ele já pega o `Vysor.exe`, o `ffmpeg.exe` e o `server.txt` (se existirem)
+de dentro da pasta `publish`, então gere o instalador DEPOIS do Passo 2
+(e do 2.5, se for incluir o ffmpeg).
+
+## Passo 5 — Publicar uma ATUALIZAÇÃO (pra quem já instalou)
+
+Quem já tem o Vysor instalado não precisa baixar nada na mão de novo: o
+app confere sozinho, ao abrir, se existe uma versão mais nova no GitHub
+Releases (ver `VysorClient/Services/UpdateChecker.cs`) e mostra um botão
+amarelo "⬆ Atualização disponível" no canto superior esquerdo. Clicando,
+ele baixa o instalador novo e abre — o instalador já sabe fechar o Vysor
+que está rodando (`CloseApplications=yes` no `Vysor.iss`) e substitui tudo.
+
+Pra isso funcionar, TODA atualização precisa seguir esta receita:
+
+1. Suba o número de versão em **dois lugares**, com o MESMO valor:
+   - `VysorClient/VysorClient.csproj` → `<Version>1.1.0</Version>`
+   - `VysorClient/installer/Vysor.iss` → `#define MyAppVersion "1.1.0"`
+2. Gere o `.exe` (Passo 2, e 2.5 se usar ffmpeg) e o instalador (Passo 4,
+   opção B) do jeito de sempre.
+3. No GitHub (repositório `dragonrange/Vysor`, já público):
+   **Releases → Draft a new release**.
+   - **Tag**: `v1.1.0` — TEM que começar com "v" e bater com o número do
+     passo 1 (é isso que o app compara pra saber se é mais novo).
+   - **Anexe** (arraste ou "Attach binaries") o arquivo
+     `VysorClient/installer/Output/VysorSetup.exe` — o nome do arquivo
+     TEM que continuar sendo exatamente `VysorSetup.exe` (é esse nome que
+     `UpdateChecker.cs` procura nos assets da release).
+   - Clique **Publish release**.
+4. Pronto. Na próxima vez que alguém abrir o Vysor (a checagem só acontece
+   ao abrir o app, não fica confirmando toda hora), o botão de atualização
+   aparece sozinho.
+
+Se você publicar uma release SEM anexar o `VysorSetup.exe` (ou esquecer o
+"v" na tag), o app simplesmente não mostra nada — ele falha em silêncio de
+propósito, pra uma checagem de atualização nunca poder quebrar a abertura
+do app.
 
 ## Resumo do fluxo completo
 

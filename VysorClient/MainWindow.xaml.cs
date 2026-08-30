@@ -1,5 +1,6 @@
 using VysorClient.Services;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -19,8 +20,11 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Clipboard = System.Windows.Clipboard;
 using Screen = System.Windows.Forms.Screen;
+using Application = System.Windows.Application;
+using MessageBox = System.Windows.MessageBox;
 
 namespace VysorClient;
 
@@ -34,7 +38,6 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ShareSourceItem> _displaySources = new();
     private readonly ObservableCollection<ShareSourceItem> _windowSources = new();
     private readonly List<string> _recentRooms = new();
-
     private bool _isStreaming = false;
     private int _selectedTabIndex = 0;
 
@@ -60,6 +63,35 @@ public partial class MainWindow : Window
     // pipeline JPEG de sempre, o tile correspondente nunca ganha uma
     // entrada aqui.
     private readonly Dictionary<StreamTileViewModel, VideoDecodeService> _tileDecoders = new();
+
+    // O MESMO conjunto de decodificadores, indexado por pessoa e seguro pra
+    // ler de qualquer thread.
+    //
+    // POR QUE PRECISA EXISTIR UMA SEGUNDA VISÃO DA MESMA COISA
+    // O _tileDecoders acima é indexado pela telinha, e telinha é objeto de
+    // interface: procurar dentro dele exige estar na thread da interface. Só
+    // que o vídeo CHEGA na thread de rede, e ela é a mesma que esvazia o
+    // socket UDP. Obrigar essa thread a esperar a interface pra descobrir pra
+    // qual decodificador entregar o quadro é o pior lugar possível pra
+    // esperar: enquanto ela espera, ninguém está lendo o socket, o sistema
+    // enche o buffer e começa a JOGAR PACOTE FORA — e, ao liberar, ela
+    // despeja de uma vez tudo que ficou represado. Era exatamente isso o
+    // "trava e roda vários quadros de uma vez".
+    private readonly ConcurrentDictionary<string, VideoDecodeService> _decodersByUser = new();
+
+    // Quem já teve o indicador "está transmitindo" aceso. Existe só pra não
+    // agendar trabalho na interface a cada quadro pra reescrever um valor que
+    // já é verdade (ver o callback de OnVideo).
+    private readonly ConcurrentDictionary<string, byte> _sharingFlagged = new();
+
+    // Coalescência do caminho JPEG, uma por pessoa (ver o callback de OnVideo).
+    private sealed class PendingJpeg
+    {
+        public byte[]? Frame;
+        public int Scheduled;
+    }
+
+    private readonly ConcurrentDictionary<string, PendingJpeg> _jpegPending = new();
 
     // Espelho de "quem eu estou assistindo" que pode ser lido com segurança
     // de outras threads (o áudio chega por uma thread do SignalR). O
@@ -125,16 +157,199 @@ public partial class MainWindow : Window
         WindowList.ItemsSource = _windowSources;
         StreamsGrid.ItemsSource = _watchedStreams;
         _watchedStreams.CollectionChanged += (s, e) => UpdateStreamsLayout();
+
+        // O melhor arranjo depende do FORMATO da área disponível, então ele
+        // muda quando a janela muda de tamanho (ou quando o painel de
+        // participantes some e a área fica mais larga). Sem isto, o arranjo
+        // ficaria congelado no que era certo no tamanho anterior.
+        StreamsGrid.SizeChanged += (s, e) => UpdateStreamsLayout();
+
         UpdateStreamsLayout();
 
         _audioCapture.OnAudioChunk += AudioCapture_OnAudioChunk;
 
+        // Nome de quem usa, lembrado da última vez. É o que permite um
+        // convite clicado entrar na sala sozinho (ver UserPrefs).
+        TxtDisplayName.Text = UserPrefs.LoadDisplayName() ?? string.Empty;
+        ChkDiscordAnnounce.IsChecked = UserPrefs.LoadAnnounceEnabled();
+        UserPrefs.ForgetLegacyWebhook();
+        ShowChannelStatus();
+
+        // Confere o estado real da integração, em segundo plano. Só quando o
+        // aviso está ligado — quem desligou não quer nem saber disso.
+        if (UserPrefs.LoadAnnounceEnabled()) _ = CheckDiscordStatusAsync();
+
         // Estado inicial da tela inicial (botões apagados até ter nome) e
         // cursor já piscando no campo do nome, pra pessoa só digitar.
         UpdateLobbyButtons();
-        Loaded += (_, _) => TxtDisplayName.Focus();
+        Loaded += (_, _) =>
+        {
+            // Com o nome já preenchido, o cursor no campo do nome não ajuda —
+            // vai direto pro campo do código, que é o que falta.
+            if (TxtDisplayName.Text.Length > 0) TxtRoomCode.Focus();
+            else TxtDisplayName.Focus();
+
+            // Convite que abriu o app (clicaram no link com o Vysor fechado).
+            if (App.PendingInvite != null) _ = AcceptInviteAsync(App.PendingInvite);
+        };
+
+        // Convite que chegou com o app já aberto, vindo da outra instância
+        // (ver App.xaml.cs / SingleInstance).
+        App.OnInviteReceived += invite => _ = AcceptInviteAsync(invite);
+
+        // Limpa o registro que a presença no Discord deixava (ver
+        // DiscordPresence, removida na 1.7.0). Sem isto ficaria pra sempre uma
+        // entrada apontando pro Vysor, de um recurso que não existe mais.
+        DiscordLegacy.ForgetPresenceRegistration();
+
+        // Garante que os convites por link abram o app, mesmo em quem usa a
+        // versão portátil (que não passa pelo instalador). Ver
+        // VysorLink.RegisterForCurrentUser.
+        VysorLink.RegisterForCurrentUser();
 
         InitSignalR();
+        _ = CheckForUpdateAsync();
+    }
+
+    // Entra numa sala a partir de um convite clicado, venha ele de onde vier
+    // (link "vysor://", botão Entrar do Discord, atalho).
+    //
+    // Este é o ÚNICO ponto de entrada de convite externo de propósito: cada
+    // integração nova só precisa produzir o código e chamar aqui, em vez de
+    // repetir todo o cuidado abaixo.
+    private async Task AcceptInviteAsync(string codeOrInvite)
+    {
+        if (string.IsNullOrWhiteSpace(codeOrInvite)) return;
+
+        // O mesmo "vysor://" carrega DUAS coisas: convite pra sala e a escolha
+        // de canal do Discord feita no navegador. Reaproveitar o link já
+        // existente evitou inventar um segundo caminho do navegador pro app —
+        // mas obriga a separar os dois logo na entrada.
+        var channel = VysorLink.TryParseChannel("vysor://" + codeOrInvite);
+        if (channel != null)
+        {
+            UserPrefs.SaveChannel(channel.ChannelId, channel.ChannelName);
+            ShowChannelStatus();
+            TxtAddBotHint.Text = $"✓ Pronto — vou avisar em #{channel.ChannelName} quando você criar uma sala.";
+            return;
+        }
+
+        // Já está numa sala? Não arrastamos a pessoa pra fora dela sem avisar
+        // — ela pode estar no meio de uma transmissão. O código fica preparado
+        // e ela decide.
+        if (ViewRoom.Visibility == Visibility.Visible)
+        {
+            TxtStreamNotice.Text = $"Convite recebido para a sala {codeOrInvite} — saia desta sala pra entrar nela.";
+            TxtStreamNotice.Visibility = Visibility.Visible;
+            return;
+        }
+
+        TxtRoomCode.Text = codeOrInvite;
+
+        // Sem nome não dá pra entrar (o servidor precisa saber quem é). Em vez
+        // de falhar em silêncio, deixa tudo pronto e pede só o que falta.
+        if (string.IsNullOrWhiteSpace(TxtDisplayName.Text))
+        {
+            TxtDisplayName.Focus();
+            return;
+        }
+
+        SetLobbyBusy(true, "Entrando na sala do convite…");
+        try
+        {
+            await _signalR.EnterRoomAsync(codeOrInvite, TxtDisplayName.Text);
+        }
+        catch
+        {
+            ShowConnectionError();
+        }
+        finally
+        {
+            SetLobbyBusy(false);
+        }
+    }
+
+    // Confere uma vez, ao abrir, se existe uma versão nova no GitHub
+    // Releases (ver UpdateChecker.cs). Nunca atrapalha a abertura do app:
+    // roda em segundo plano e, se der qualquer errado (sem internet, GitHub
+    // fora do ar, sem release ainda), simplesmente não mostra nada.
+    private UpdateInfo? _pendingUpdate;
+
+    private async Task<UpdateInfo?> CheckForUpdateAsync()
+    {
+        var update = await UpdateChecker.CheckAsync();
+        if (update == null) return null;
+
+        _pendingUpdate = update;
+        Dispatcher.Invoke(() =>
+        {
+            BtnUpdate.Content = $"⬆ Atualização disponível (v{update.Version}) — clique pra instalar";
+            UpdateBanner.Visibility = Visibility.Visible;
+        });
+        return update;
+    }
+
+    // Botão da tela inicial. A checagem automática (ao abrir) fica muda
+    // quando não acha nada — faz sentido lá, ninguém quer aviso nenhum toda
+    // vez que abre o app à toa. Aqui é o oposto: a pessoa PEDIU a resposta,
+    // então ela precisa vir, seja "achei" ou "não tem nada novo".
+    private bool _checkingUpdateManually;
+
+    private async void BtnCheckUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (_checkingUpdateManually) return;
+        _checkingUpdateManually = true;
+
+        BtnCheckUpdate.IsEnabled = false;
+        TxtUpdateCheckResult.Text = "Verificando…";
+        try
+        {
+            var update = await CheckForUpdateAsync();
+            TxtUpdateCheckResult.Text = update != null
+                ? $"Encontrei a versão {update.Version} — veja o aviso no canto inferior direito."
+                : $"Você já está na versão mais recente (v{UpdateChecker.CurrentVersion}).";
+        }
+        finally
+        {
+            BtnCheckUpdate.IsEnabled = true;
+            _checkingUpdateManually = false;
+        }
+    }
+
+    private bool _updateInProgress;
+
+    private async void BtnUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (_updateInProgress || _pendingUpdate == null) return;
+        _updateInProgress = true;
+
+        var update = _pendingUpdate;
+        BtnUpdate.IsEnabled = false;
+        string originalText = (string)BtnUpdate.Content;
+
+        try
+        {
+            var progress = new Progress<double>(p =>
+                BtnUpdate.Content = $"⬇ Baixando atualização… {p:P0}");
+
+            string installerPath = await UpdateChecker.DownloadInstallerAsync(update.DownloadUrl, progress);
+
+            // Abre o instalador (ele mesmo pede elevação — PrivilegesRequired
+            // admin no Vysor.iss) e sai. O instalador detecta o Vysor.exe
+            // rodando (CloseApplications=yes) e cuida de fechar, atualizar e
+            // deixar pronto pra abrir de novo.
+            Process.Start(new ProcessStartInfo(installerPath) { UseShellExecute = true });
+            Application.Current.Shutdown();
+        }
+        catch (Exception ex)
+        {
+            BtnUpdate.Content = originalText;
+            BtnUpdate.IsEnabled = true;
+            _updateInProgress = false;
+            MessageBox.Show(this,
+                $"Não foi possível baixar a atualização agora.\n\n{ex.Message}\n\nTente de novo mais tarde, ou baixe manualmente em:\n{update.ReleaseUrl}",
+                "Atualização", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     // O convite completo da sala em que estamos ("100.94.12.7:5799/AB12CD").
@@ -193,9 +408,82 @@ public partial class MainWindow : Window
 
         // Único caminho de entrada de vídeo/áudio: o direto (P2P). O servidor
         // não tem mais como mandar isto (ver RoomHub.cs).
+        // CAMINHO RÁPIDO, sem passar pela interface.
+        //
+        // Depois do primeiro quadro de uma pessoa, tudo que este callback
+        // precisa fazer é entregar os bytes ao decodificador dela — e
+        // decoder.Feed() só põe numa fila, nunca bloqueia. Nada disso é
+        // trabalho de interface. Fazendo aqui mesmo, a thread de rede volta
+        // imediatamente pra continuar esvaziando o socket UDP (ver o
+        // comentário em _decodersByUser).
+        //
+        // A interface só é acionada no caso RARO: o primeiro quadro de alguém
+        // (quando ainda não existe decodificador) e o caminho antigo de JPEG.
+        // E aí com InvokeAsync, que não faz ninguém esperar.
         _peerMedia.OnVideo += (userId, frameBytes) =>
-            Dispatcher.Invoke(() => HandleIncomingFrame(userId, frameBytes));
+        {
+            if (frameBytes.Length > 1 && frameBytes[0] == 0x01 &&
+                _decodersByUser.TryGetValue(userId, out var decoder))
+            {
+                byte[] au = new byte[frameBytes.Length - 1];
+                Buffer.BlockCopy(frameBytes, 1, au, 0, au.Length);
+                decoder.Feed(au);
+
+                // Marcar "esta pessoa está transmitindo" é coisa de interface,
+                // mas só muda UMA vez. Sem esta checagem, agendaríamos um
+                // trabalho na interface a cada quadro só pra reescrever um
+                // valor que já era verdade.
+                if (_sharingFlagged.TryAdd(userId, 1))
+                    Dispatcher.InvokeAsync(() => MarkParticipantSharing(userId));
+                return;
+            }
+
+            // Caminho JPEG (quem não conseguiu subir encoder por GPU). Aqui
+            // não existe decodificador: o quadro vira imagem direto na
+            // interface. Sem coalescer, seria um agendamento por quadro — a
+            // mesma fila sem limite que causava "trava e roda vários de uma
+            // vez", só que na outra ponta do app. Guardamos SEMPRE o quadro
+            // mais recente e mantemos no máximo UM agendamento pendente.
+            if (frameBytes.Length > 1 && frameBytes[0] != 0x01)
+            {
+                var slot = _jpegPending.GetOrAdd(userId, _ => new PendingJpeg());
+
+                byte[] jpeg = new byte[frameBytes.Length - 1];
+                Buffer.BlockCopy(frameBytes, 1, jpeg, 0, jpeg.Length);
+                Interlocked.Exchange(ref slot.Frame, jpeg);
+
+                if (Interlocked.CompareExchange(ref slot.Scheduled, 1, 0) != 0) return;
+
+                Dispatcher.InvokeAsync(() =>
+                {
+                    Interlocked.Exchange(ref slot.Scheduled, 0);
+                    byte[]? latest = Interlocked.Exchange(ref slot.Frame, null);
+                    if (latest == null) return;
+
+                    MarkParticipantSharing(userId);
+                    var tile = _watchedStreams.FirstOrDefault(t => t.UserId == userId);
+                    if (tile != null) tile.Image = BytesToBitmapImage(latest);
+                }, System.Windows.Threading.DispatcherPriority.Background);
+                return;
+            }
+
+            Dispatcher.InvokeAsync(() => HandleIncomingFrame(userId, frameBytes));
+        };
         _peerMedia.OnAudio += HandleIncomingAudio;
+
+        // Perdeu quadro de vídeo desta pessoa: manda o decodificador dela
+        // esperar o próximo quadro-chave em vez de seguir com a corrente
+        // quebrada (o que produzia a imagem com rastro do quadro anterior).
+        // InvokeAsync, não Invoke: isto vem da thread de rede, que não pode
+        // ficar parada esperando a interface.
+        // Também pelo índice por pessoa: pedir resincronia não toca em nada da
+        // interface, então não há motivo pra essa mensagem entrar na fila dela
+        // — ainda mais vindo de uma thread que precisa voltar a ler o socket.
+        _peerMedia.OnVideoLoss += (userId) =>
+        {
+            if (_decodersByUser.TryGetValue(userId, out var decoder))
+                decoder.RequestResync();
+        };
 
         _signalR.OnPeerCandidates += (userId, candidates) =>
             _peerMedia?.AddPeerCandidates(userId, candidates);
@@ -229,6 +517,14 @@ public partial class MainWindow : Window
             EnterRoom(code);
             UpdateInvite(code);
             _ = _signalR.AnnounceAddressAsync(LocalAddresses.Best());
+
+            // Avisa o canal do Discord, se houver um configurado.
+            //
+            // Só ao CRIAR, nunca ao entrar: se cada pessoa que entrasse
+            // postasse também, uma sala de cinco viraria cinco mensagens
+            // iguais no canal, e o aviso deixaria de ser útil pra virar
+            // barulho.
+            _ = AnnounceRoomOnDiscordAsync(code, TxtDisplayName.Text);
 
             // Abre o canal direto com os amigos. A partir daqui o vídeo passa
             // a ir de PC pra PC, e o servidor só apresenta um ao outro.
@@ -329,6 +625,11 @@ public partial class MainWindow : Window
             var participant = _participants.FirstOrDefault(p => p.UserId == id);
             if (participant != null) participant.IsSharing = false;
 
+            // Libera a marca pra que, se a pessoa voltar a transmitir, o
+            // primeiro quadro novo volte a acender o indicador (ver
+            // _sharingFlagged).
+            _sharingFlagged.TryRemove(id, out _);
+
             // Some com o tile em vez de deixar o último quadro congelado sem
             // nenhum aviso — se a pessoa voltar a transmitir, o play acende
             // de novo e dá pra assistir num tile novo. (O "!t.IsLocal"
@@ -372,14 +673,20 @@ public partial class MainWindow : Window
 
     // Um quadro chegou — não importa se veio direto do PC do amigo ou pelo
     // servidor. Este é o único lugar que trata vídeo recebido.
+    // Acende o indicador "está transmitindo" ao lado do nome. Separado num
+    // método próprio porque agora o caminho rápido (ver o callback de OnVideo)
+    // precisa acionar só isto, sem o resto do tratamento de quadro.
+    private void MarkParticipantSharing(string userId)
+    {
+        var participant = _participants.FirstOrDefault(p => p.UserId == userId);
+        if (participant != null && !participant.IsSharing) participant.IsSharing = true;
+    }
+
     private void HandleIncomingFrame(string userId, byte[] frameBytes)
     {
         {
-            var participant = _participants.FirstOrDefault(p => p.UserId == userId);
-            if (participant != null && !participant.IsSharing)
-            {
-                participant.IsSharing = true;
-            }
+            MarkParticipantSharing(userId);
+            _sharingFlagged.TryAdd(userId, 1);
 
             var tile = _watchedStreams.FirstOrDefault(t => t.UserId == userId);
             if (tile == null || frameBytes.Length == 0) return;
@@ -538,6 +845,19 @@ public partial class MainWindow : Window
 
     // "Testar minha conexão": responde de uma vez se os amigos conseguem
     // chegar até aqui, e o que fazer quando não conseguem.
+    // O popup técnico (UPnP, CGNAT, "cole isso no grupo") era pra EU
+    // conseguir coletar dado real de conectividade de cada amigo enquanto
+    // decidíamos se dava pra tirar o host fixo — serviu ao propósito e não
+    // faz mais sentido pra quem só quer saber "vai funcionar ou não".
+    // Agora é só a linha de baixo, com uma frase direta.
+    private static string SimpleConnectionMessage(ConnectivityCheck.Report report) => report.Nat?.Kind switch
+    {
+        NatBehavior.Kind.DirectConnectionPossible => "✓ Conexão confirmada — a transmissão direta com seus amigos deve funcionar bem.",
+        NatBehavior.Kind.NeedsBridge => "⚠ Sua rede pode dificultar a conexão direta com alguns amigos. Se a tela de alguém não aparecer, tente trocar de rede (Wi-Fi/dados) antes de compartilhar.",
+        NatBehavior.Kind.Blocked => "⚠ Sua rede parece bloquear conexão direta. Se possível, tente outra rede antes de compartilhar.",
+        _ => "Não consegui confirmar sua conexão agora — tente de novo em instantes."
+    };
+
     private async void BtnTestConnection_Click(object sender, RoutedEventArgs e)
     {
         BtnTestConnection.IsEnabled = false;
@@ -553,38 +873,7 @@ public partial class MainWindow : Window
                 LocalAddresses.PublicAddress = $"{report.SuggestedAddress}:{LocalServer.Port}";
             }
 
-            TxtConnectionResult.Text = ConnectivityCheck.ShortSummary(report);
-
-            // Duas perguntas diferentes, mostradas juntas de propósito:
-            //   1. "eu consigo hospedar a sala?" — vale pra versão de hoje;
-            //   2. "eu consigo falar direto com meus amigos?" — é o que decide
-            //      se o app pode deixar de precisar de host, e é a resposta
-            //      que estamos coletando do grupo inteiro agora.
-            string texto = report.Explanation + "\n\n" + report.WhatToDo;
-
-            if (report.Nat != null)
-            {
-                texto += "\n\n"
-                       + "───────────────\n"
-                       + "CONEXÃO DIRETA COM SEUS AMIGOS\n"
-                       + report.Nat.Title + "\n\n"
-                       + report.Nat.Explanation;
-            }
-
-            texto += "\n\n───────────────\nRESUMO: " + ConnectivityCheck.ShortSummary(report);
-
-            // Vai pra área de transferência já pronto pra colar no grupo —
-            // é assim que dá pra juntar o resultado de várias pessoas sem
-            // ninguém precisar digitar nada.
-            try { Clipboard.SetText(ConnectivityCheck.ShortSummary(report)); } catch { }
-
-            System.Windows.MessageBox.Show(
-                texto + "\n\n(o resumo já foi copiado — é só colar no grupo)",
-                report.Title,
-                MessageBoxButton.OK,
-                report.Verdict == ConnectivityCheck.Verdict.ReachableFromInternet
-                    ? MessageBoxImage.Information
-                    : MessageBoxImage.Warning);
+            TxtConnectionResult.Text = SimpleConnectionMessage(report);
         }
         catch (Exception ex)
         {
@@ -659,14 +948,17 @@ public partial class MainWindow : Window
         var existing = _watchedStreams.FirstOrDefault(t => t.UserId == tile.UserId);
         if (existing != null) return existing;
 
-        // Se algum tile está fixado (pin), o novo entra escondido — senão
-        // ele apareceria junto e quebraria o pin, que existe justamente pra
-        // deixar UM vídeo ocupando todo o espaço.
-        if (_pinnedTile != null) tile.TileVisibility = Visibility.Collapsed;
-
         tile.PropertyChanged += Tile_PropertyChanged;
         if (!tile.IsLocal) _watchedUserIds[tile.UserId] = 1;
         _watchedStreams.Add(tile);
+
+        // Decide a visibilidade DEPOIS de entrar na lista, e pelas mesmas
+        // regras de todo mundo (pin ativo, prévia oculta) — ver
+        // ApplyTileVisibility. Antes isto era decidido aqui na mão, só olhando
+        // o pin, e por isso um tile novo entrando com a prévia oculta não
+        // respeitava esse estado.
+        ApplyTileVisibility();
+        RefreshLocalTileToggle();
         return tile;
     }
 
@@ -679,14 +971,48 @@ public partial class MainWindow : Window
         var decoder = new VideoDecodeService();
         _tileDecoders[tile] = decoder;
 
+        // Registra também no índice por pessoa, que é o que a thread de rede
+        // consulta (ver _decodersByUser). A prévia local não entra: ela é
+        // alimentada pelo encoder daqui mesmo, não por vídeo que chega.
+        if (!tile.IsLocal && !string.IsNullOrEmpty(tile.UserId))
+            _decodersByUser[tile.UserId] = decoder;
+
         // InvokeAsync (não Invoke): esse evento vem da thread que lê a saída
         // do ffmpeg, e ela não pode ficar esperando a interface — se ficar,
         // ela para de drenar a saída, o ffmpeg trava, e o app inteiro
         // congela junto.
-        decoder.OnFrameDecoded += bmpBytes => Dispatcher.InvokeAsync(() =>
+        //
+        // SÓ ISSO NÃO BASTAVA, e foi o que causava "trava e do nada roda
+        // vários quadros de uma vez": cada quadro decodificado agendava o SEU
+        // PRÓPRIO InvokeAsync em prioridade Background, sem limite nenhum. Se
+        // a thread da interface ficasse ocupada um instante (a mesma GC
+        // pressure do lado de captura, ou só várias telinhas ao mesmo tempo),
+        // esses agendamentos se empilhavam — e quando a interface finalmente
+        // respirava, despejava a fila inteira de uma vez, cada um sobrepondo
+        // o anterior na tela quase instantaneamente. Visualmente isso é
+        // indistinguível de "travou e depois pulou vários quadros".
+        //
+        // A correção: nunca ter mais de UM InvokeAsync pendente por telinha.
+        // Quadros que chegam enquanto um já está agendado só atualizam qual é
+        // o "mais recente" — quando a interface finalmente processa, ela
+        // sempre mostra o quadro mais NOVO que existe, nunca uma fila de
+        // quadros velhos. Mesmo princípio de "descarta o velho, guarda o
+        // novo" que já usamos do lado de captura/envio.
+        byte[]? latestFrame = null;
+        int updateScheduled = 0;
+
+        decoder.OnFrameDecoded += bmpBytes =>
         {
-            if (_watchedStreams.Contains(tile)) tile.Image = BytesToBitmapImage(bmpBytes);
-        }, System.Windows.Threading.DispatcherPriority.Background);
+            Interlocked.Exchange(ref latestFrame, bmpBytes);
+            if (Interlocked.CompareExchange(ref updateScheduled, 1, 0) != 0) return;
+
+            Dispatcher.InvokeAsync(() =>
+            {
+                Interlocked.Exchange(ref updateScheduled, 0);
+                byte[]? frame = Interlocked.Exchange(ref latestFrame, null);
+                if (frame != null && _watchedStreams.Contains(tile)) tile.Image = BytesToBitmapImage(frame);
+            }, System.Windows.Threading.DispatcherPriority.Background);
+        };
 
         _ = Task.Run(() =>
         {
@@ -727,8 +1053,19 @@ public partial class MainWindow : Window
             _tileDecoders.Remove(tile);
         }
 
+        // Tira do índice por pessoa ANTES de qualquer outra coisa poder
+        // procurar por ele: um decodificador já parado ainda aceitaria Feed()
+        // sem reclamar, e os quadros iriam pro nada em silêncio.
+        if (!tile.IsLocal && !string.IsNullOrEmpty(tile.UserId))
+        {
+            _decodersByUser.TryRemove(tile.UserId, out _);
+            _sharingFlagged.TryRemove(tile.UserId, out _);
+        }
+
         var participant = _participants.FirstOrDefault(p => p.UserId == tile.UserId);
         if (participant != null) participant.IsWatching = false;
+
+        RefreshLocalTileToggle();
     }
 
     // Derruba todos os decodificadores de vídeo por hardware ainda de pé —
@@ -744,6 +1081,8 @@ public partial class MainWindow : Window
         }
         _tileDecoders.Clear();
         _watchedUserIds.Clear();
+        _decodersByUser.Clear();
+        _sharingFlagged.Clear();
     }
 
     private void Tile_PropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -796,24 +1135,222 @@ public partial class MainWindow : Window
         else
         {
             _pinnedTile = tile;
-            foreach (var t in _watchedStreams)
-            {
-                bool isThis = ReferenceEquals(t, tile);
-                t.IsPinned = isThis;
-                t.TileVisibility = isThis ? Visibility.Visible : Visibility.Collapsed;
-            }
+
+            // Fixar a SUA prévia enquanto ela está oculta seria pedir duas
+            // coisas contrárias ao mesmo tempo — e o resultado seria a área de
+            // transmissões inteira em branco, sem nada explicando por quê.
+            // Fixar vence: é o gesto mais recente e mais explícito.
+            if (tile.IsLocal) SetLocalTileHidden(false);
+
+            foreach (var t in _watchedStreams) t.IsPinned = ReferenceEquals(t, tile);
         }
 
+        ApplyTileVisibility();
         UpdateStreamsLayout();
     }
 
     private void UnpinAll()
     {
         _pinnedTile = null;
+        foreach (var t in _watchedStreams) t.IsPinned = false;
+        ApplyTileVisibility();
+    }
+
+    // --- Ocultar a própria prévia -------------------------------------------------
+
+    // Enquanto você transmite, a sua própria tela ocupa um espaço igual ao dos
+    // outros — e você já está vendo essa tela, é o seu monitor. Com três
+    // pessoas, isso custa um terço da área útil pra mostrar algo que não
+    // acrescenta nada.
+    private bool _hideLocalTile;
+
+    private void BtnToggleLocalTile_Click(object sender, RoutedEventArgs e)
+    {
+        SetLocalTileHidden(!_hideLocalTile);
+        UpdateStreamsLayout();
+    }
+
+    private void SetLocalTileHidden(bool hidden)
+    {
+        _hideLocalTile = hidden;
+
+        // Ocultar a prévia enquanto ela é a telinha fixada deixaria a área
+        // vazia (ver o comentário em BtnPinTile_Click) — então desfaz o pin.
+        if (hidden && _pinnedTile != null && _pinnedTile.IsLocal)
+        {
+            _pinnedTile = null;
+            foreach (var t in _watchedStreams) t.IsPinned = false;
+        }
+
+        BtnToggleLocalTile.Content = hidden ? "🙉 Mostrar minha tela" : "🙈 Ocultar minha tela";
+        ApplyTileVisibility();
+    }
+
+    // Mantém o botão coerente com a realidade: ele só faz sentido quando existe
+    // uma prévia sua na área de transmissões. Chamado sempre que tiles entram
+    // ou saem.
+    private void RefreshLocalTileToggle()
+    {
+        bool hasLocal = _watchedStreams.Any(t => t.IsLocal);
+        BtnToggleLocalTile.Visibility = hasLocal ? Visibility.Visible : Visibility.Collapsed;
+
+        // Parou de transmitir com a prévia oculta: o estado volta ao normal,
+        // pra que na próxima transmissão a tela não apareça "sumida" sem que
+        // ninguém tenha pedido isso.
+        if (!hasLocal && _hideLocalTile) SetLocalTileHidden(false);
+    }
+
+    // --- Painel de diagnóstico ----------------------------------------------------
+    //
+    // POR QUE ISTO EXISTE
+    // Quando a imagem engasga, quem assiste vê sempre a MESMA coisa,
+    // independente da causa: pode ser o remetente não dando conta de
+    // codificar, pode ser pacote perdido no caminho, ou pode ser a tela de
+    // quem assiste. Três problemas diferentes, três correções diferentes, e
+    // nenhuma forma de distinguir olhando. Isso já custou rodadas de palpite.
+    //
+    // Estes números separam os três casos, e são baratos: contadores que o app
+    // já mantinha internamente, lidos uma vez por segundo e só quando o painel
+    // está aberto.
+    private DispatcherTimer? _diagTimer;
+    private long _lastEncoded, _lastDecodedTotal;
+
+    private void BtnToggleDiag_Click(object sender, RoutedEventArgs e)
+    {
+        bool showing = DiagPanel.Visibility == Visibility.Visible;
+
+        if (showing)
+        {
+            DiagPanel.Visibility = Visibility.Collapsed;
+            _diagTimer?.Stop();
+            BtnToggleDiag.ToolTip = "Mostrar números de diagnóstico";
+            return;
+        }
+
+        DiagPanel.Visibility = Visibility.Visible;
+        BtnToggleDiag.ToolTip = "Esconder números de diagnóstico";
+
+        _diagTimer ??= CreateDiagTimer();
+        _lastEncoded = _videoEncode?.EncodedFrames ?? 0;
+        _lastDecodedTotal = TotalDecodedFrames();
+        UpdateDiag();
+        _diagTimer.Start();
+    }
+
+    private DispatcherTimer CreateDiagTimer()
+    {
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        timer.Tick += (_, _) => UpdateDiag();
+        return timer;
+    }
+
+    private long TotalDecodedFrames()
+    {
+        long total = 0;
+        foreach (var decoder in _tileDecoders.Values) total += decoder.DecodedFrames;
+        return total;
+    }
+
+    private void UpdateDiag()
+    {
+        var text = new StringBuilder();
+
+        // --- lado de ENVIAR ---
+        var encoder = _videoEncode;
+        if (encoder != null && encoder.IsRunning)
+        {
+            long encoded = encoder.EncodedFrames;
+            long fps = Math.Max(0, encoded - _lastEncoded);
+            _lastEncoded = encoded;
+
+            text.AppendLine("ENVIANDO");
+            text.AppendLine($"  {fps} fps saindo  ({_targetFps} pedidos)");
+
+            // Este é o número que denuncia o REMETENTE: a captura produziu
+            // quadros que o codificador não conseguiu engolir. Se sobe durante
+            // a engasgada, o problema é aqui — GPU no limite, não a rede.
+            text.AppendLine($"  {encoder.DroppedFrames} descartados no encoder");
+
+            if (_peerMedia != null)
+            {
+                text.AppendLine($"  {_peerMedia.QueuedVideoPackets} pacotes na fila de saída");
+                text.AppendLine($"  {_peerMedia.SendQueueDrops} quadros perdidos por fila cheia");
+            }
+        }
+
+        // --- lado de RECEBER ---
+        if (_tileDecoders.Count > 0)
+        {
+            long decoded = TotalDecodedFrames();
+            long fps = Math.Max(0, decoded - _lastDecodedTotal);
+            _lastDecodedTotal = decoded;
+
+            long resyncs = 0;
+            foreach (var d in _tileDecoders.Values) resyncs += d.Resyncs;
+
+            if (text.Length > 0) text.AppendLine();
+            text.AppendLine("RECEBENDO");
+            text.AppendLine($"  {fps} fps chegando (todas as telinhas)");
+
+            // Estes dois denunciam a REDE: quadro que chegou faltando pedaço,
+            // e as pausas que isso causou esperando um novo quadro-chave.
+            if (_peerMedia != null)
+                text.AppendLine($"  {_peerMedia.ReassemblyLosses} quadros perdidos na rede");
+            text.AppendLine($"  {resyncs} pausas pra recuperar a imagem");
+        }
+
+        // O Discord saiu daqui junto com a presença (1.7.0): quem avisa o canal
+        // agora é o servidor, e o estado dessa integração aparece na tela
+        // inicial, verificado de verdade (ver CheckDiscordStatusAsync). Repetir
+        // aqui seria mostrar dois lugares que podem discordar.
+
+        TxtDiag.Text = text.ToString().TrimEnd();
+    }
+
+    // --- Ocultar o painel de participantes ----------------------------------------
+
+    // A lista de participantes é estreita, mas 200px de uma janela de 1000
+    // são 20% da largura — e ela fica igual o tempo todo depois que a sala se
+    // forma. Poder recolhê-la devolve esse espaço pro vídeo.
+    private bool _hideParticipants;
+
+    private void BtnToggleParticipants_Click(object sender, RoutedEventArgs e)
+    {
+        _hideParticipants = !_hideParticipants;
+
+        ParticipantsPanel.Visibility = _hideParticipants ? Visibility.Collapsed : Visibility.Visible;
+
+        // Esconder o painel não basta: a COLUNA continuaria reservando os
+        // 200px, e a área de vídeo não ganharia nada. É a largura da coluna
+        // que precisa ir a zero.
+        ParticipantsColumn.Width = _hideParticipants
+            ? new GridLength(0)
+            : new GridLength(200);
+
+        BtnToggleParticipants.Content = _hideParticipants
+            ? "👥 Mostrar participantes"
+            : "👥 Ocultar participantes";
+
+        // A área de vídeo mudou de formato, então o melhor arranjo pode ter
+        // mudado junto. (O SizeChanged também dispara, mas chamar aqui torna a
+        // ligação explícita em vez de depender de um efeito colateral.)
+        UpdateStreamsLayout();
+    }
+
+    // ÚNICO lugar que decide se cada tile aparece. Antes essa decisão estava
+    // espalhada (o pin escrevia direto no TileVisibility de cada um, e quem
+    // adicionava tile escrevia por conta própria) — com dois motivos diferentes
+    // pra esconder um tile, isso vira contradição: um deles sobrescreve o
+    // outro dependendo da ordem em que aconteceram.
+    private void ApplyTileVisibility()
+    {
         foreach (var t in _watchedStreams)
         {
-            t.IsPinned = false;
-            t.TileVisibility = Visibility.Visible;
+            bool hidden =
+                (t.IsLocal && _hideLocalTile) ||
+                (_pinnedTile != null && !ReferenceEquals(t, _pinnedTile));
+
+            t.TileVisibility = hidden ? Visibility.Collapsed : Visibility.Visible;
         }
     }
 
@@ -824,18 +1361,84 @@ public partial class MainWindow : Window
         var uniformGrid = FindVisualChild<UniformGrid>(StreamsGrid);
         if (uniformGrid == null) return;
 
-        if (_pinnedTile != null)
+        // Só contam os tiles que estão realmente aparecendo: com a prévia
+        // oculta (ou um pin ativo), os escondidos não devem reservar espaço.
+        int count = _watchedStreams.Count(t => t.TileVisibility == Visibility.Visible);
+
+        if (_pinnedTile != null || count <= 1)
         {
             uniformGrid.Columns = 1;
             uniformGrid.Rows = 1;
+            return;
         }
-        else
+
+        var (cols, rows) = BestGrid(count, StreamsGrid.ActualWidth, StreamsGrid.ActualHeight);
+        uniformGrid.Columns = cols;
+        uniformGrid.Rows = rows;
+    }
+
+    // Escolhe em quantas colunas e linhas dividir a área, de forma a deixar
+    // cada vídeo o MAIOR possível.
+    //
+    // POR QUE A CONTA ANTIGA DEIXAVA TUDO PEQUENO
+    // Antes eram sempre "raiz quadrada da quantidade" colunas. Pra duas
+    // pessoas isso dá 2 colunas × 1 linha: as duas lado a lado. Parece o
+    // arranjo óbvio, e é o pior possível. Um vídeo é deitado (16:9); a área
+    // disponível também é. Cortando essa área ao MEIO NA VERTICAL, cada metade
+    // fica estreita e alta — quase o contrário do formato do vídeo. O vídeo
+    // então encolhe até caber na largura e sobra tarja preta em cima e embaixo,
+    // que foi exatamente o que apareceu na tela: duas imagens pequenas cercadas
+    // de preto. Empilhando uma sobre a outra, cada metade continua deitada, o
+    // vídeo cabe muito melhor e as duas ficam bem maiores.
+    //
+    // Em vez de decidir isso caso a caso, a conta testa TODOS os arranjos
+    // possíveis e mede, pra cada um, que tamanho o vídeo realmente teria — e
+    // escolhe o maior. Assim vale pra qualquer quantidade de pessoas e pra
+    // qualquer formato de janela, inclusive quando o usuário redimensiona.
+    private const double VideoAspect = 16.0 / 9.0;
+
+    internal static (int Cols, int Rows) BestGrid(int count, double width, double height)
+    {
+        if (count <= 1) return (1, 1);
+
+        // Área ainda não medida (a janela está abrindo): mantém o
+        // comportamento antigo até a primeira medição real chegar.
+        if (width <= 0 || height <= 0)
         {
-            int count = Math.Max(1, _watchedStreams.Count);
-            int cols = (int)Math.Ceiling(Math.Sqrt(count));
-            uniformGrid.Columns = cols;
-            uniformGrid.Rows = 0;
+            int fallback = (int)Math.Ceiling(Math.Sqrt(count));
+            return (fallback, (int)Math.Ceiling((double)count / fallback));
         }
+
+        int bestCols = 1, bestRows = count;
+        double bestArea = -1;
+
+        for (int cols = 1; cols <= count; cols++)
+        {
+            int rows = (int)Math.Ceiling((double)count / cols);
+
+            // A margem de 4 de cada lado do tile (ver o DataTemplate no XAML)
+            // conta: sem descontá-la, arranjos com muitas células pareceriam
+            // melhores do que realmente são.
+            double cellW = width / cols - 8;
+            double cellH = height / rows - 8;
+            if (cellW <= 0 || cellH <= 0) continue;
+
+            // O vídeo entra inteiro na célula sem distorcer (Stretch="Uniform"),
+            // então o lado limitante manda no tamanho final.
+            double videoW = Math.Min(cellW, cellH * VideoAspect);
+            double area = videoW * (videoW / VideoAspect);
+
+            // ">" e não ">=": em empate fica o arranjo com menos colunas, que é
+            // o mais alto e o que costuma parecer mais natural.
+            if (area > bestArea)
+            {
+                bestArea = area;
+                bestCols = cols;
+                bestRows = rows;
+            }
+        }
+
+        return (bestCols, bestRows);
     }
 
     private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
@@ -883,18 +1486,49 @@ public partial class MainWindow : Window
     }
 
     // Enquanto uma tentativa está em curso, os botões da tela inicial ficam
-    // apagados e o texto conta o que está sendo feito.
+    // apagados e o texto conta o que está sendo feito — com reticências
+    // animadas (".", "..", "...").
+    //
+    // Existe porque o servidor de sinalização mora num plano grátis que
+    // "dorme" sem uso (ver render.yaml) — a primeira tentativa depois de um
+    // tempo parado pode levar uns 50 segundos pra acordar. Sem nenhum
+    // movimento na tela nesse tempo todo, parece que o app travou; é
+    // exatamente esse tipo de silêncio que faz a pessoa clicar de novo (e
+    // atrapalhar a tentativa que já estava em andamento).
     private void SetLobbyBusy(bool busy, string? message = null)
     {
         _lobbyBusy = busy;
-        TxtNameHint.Text = busy
-            ? (message ?? "Um instante…")
-            : "Escolha um nome para seus amigos te reconhecerem na sala.";
+
+        if (busy)
+        {
+            _lobbyBusyMessage = message ?? "Um instante";
+            _lobbyBusyDots = 0;
+            TxtNameHint.Text = _lobbyBusyMessage;
+            _lobbyBusyTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+            _lobbyBusyTimer.Tick -= LobbyBusyTimer_Tick;
+            _lobbyBusyTimer.Tick += LobbyBusyTimer_Tick;
+            _lobbyBusyTimer.Start();
+        }
+        else
+        {
+            _lobbyBusyTimer?.Stop();
+            TxtNameHint.Text = "Escolha um nome para seus amigos te reconhecerem na sala.";
+        }
+
         TxtNameHint.Visibility = Visibility.Visible;
         UpdateLobbyButtons();
     }
 
     private bool _lobbyBusy;
+    private string _lobbyBusyMessage = "";
+    private int _lobbyBusyDots;
+    private DispatcherTimer? _lobbyBusyTimer;
+
+    private void LobbyBusyTimer_Tick(object? sender, EventArgs e)
+    {
+        _lobbyBusyDots = (_lobbyBusyDots + 1) % 4;   // 0,1,2,3 pontos, em loop
+        TxtNameHint.Text = _lobbyBusyMessage + new string('.', _lobbyBusyDots);
+    }
 
     private async void BtnJoinRoom_Click(object sender, RoutedEventArgs e)
     {
@@ -981,7 +1615,6 @@ public partial class MainWindow : Window
         TxtActiveCode.Text = code;
         ViewLobby.Visibility = Visibility.Collapsed;
         ViewRoom.Visibility = Visibility.Visible;
-
         if (!_recentRooms.Contains(code))
         {
             _recentRooms.Add(code);
@@ -1024,7 +1657,6 @@ public partial class MainWindow : Window
         _participants.Clear();
         _myUserId = null;
         TxtActiveCode.Text = "------";
-
         // Troca a tela ANTES de esperar o servidor: se a conexão estiver
         // ruim, o usuário sairia "preso" na tela da sala até dar timeout —
         // ou pior, uma exceção num handler async void derrubaria o app.
@@ -1203,6 +1835,9 @@ public partial class MainWindow : Window
         _windowCaptureStrategy = WindowCaptureStrategy.Auto;
         _blankPrintWindowFrames = 0;
         _captureInspectCounter = 0;
+        _lastFrameStamp = 0;
+        _frozenFrames = 0;
+        _suggestedFullScreen = false;
         TxtStreamNotice.Visibility = Visibility.Collapsed;
         _consecutiveCaptureFailures = 0;
         _captureFailureWarned = false;
@@ -1281,11 +1916,24 @@ public partial class MainWindow : Window
             {
                 // InvokeAsync (não Invoke): esse evento vem da thread que lê
                 // a saída do ffmpeg e ela não pode ficar esperando a
-                // interface — ver comentário em CreateDecoderForTile.
-                localDecoder.OnFrameDecoded += bmpBytes => Dispatcher.InvokeAsync(() =>
+                // interface. E só UM agendamento pendente por vez — mesmo
+                // motivo e mesma correção de CreateDecoderForTile (sem isso,
+                // a prévia também travava e depois pulava vários quadros).
+                byte[]? latestLocalFrame = null;
+                int localUpdateScheduled = 0;
+
+                localDecoder.OnFrameDecoded += bmpBytes =>
                 {
-                    if (_watchedStreams.Contains(localTile)) localTile.Image = BytesToBitmapImage(bmpBytes);
-                }, System.Windows.Threading.DispatcherPriority.Background);
+                    Interlocked.Exchange(ref latestLocalFrame, bmpBytes);
+                    if (Interlocked.CompareExchange(ref localUpdateScheduled, 1, 0) != 0) return;
+
+                    Dispatcher.InvokeAsync(() =>
+                    {
+                        Interlocked.Exchange(ref localUpdateScheduled, 0);
+                        byte[]? frame = Interlocked.Exchange(ref latestLocalFrame, null);
+                        if (frame != null && _watchedStreams.Contains(localTile)) localTile.Image = BytesToBitmapImage(frame);
+                    }, System.Windows.Threading.DispatcherPriority.Background);
+                };
                 _tileDecoders[localTile] = localDecoder;
             }
 
@@ -1483,14 +2131,16 @@ public partial class MainWindow : Window
                 {
                     if (rawBmp.Width == fixedWidth && rawBmp.Height == fixedHeight)
                     {
-                        encoder.Feed(BitmapToBgraBytes(rawBmp));
+                        var frame = BitmapToBgraBytes(rawBmp);
+                        encoder.Feed(frame.Buffer, frame.Length);
                     }
                     else
                     {
                         // Tamanho mudou (janela redimensionada): reenquadra
                         // no tamanho que o ffmpeg está esperando.
                         using var fitted = DrawToFixedSize(rawBmp, fixedWidth, fixedHeight);
-                        encoder.Feed(BitmapToBgraBytes(fitted));
+                        var frame = BitmapToBgraBytes(fitted);
+                        encoder.Feed(frame.Buffer, frame.Length);
                     }
 
                     // Prévia de emergência (só quando o decodificador da
@@ -1653,16 +2303,24 @@ public partial class MainWindow : Window
     // Extrai os bytes crus BGRA de um Bitmap Format32bppArgb — o stride de
     // um bitmap 32bpp no GDI+ é sempre width*4 (múltiplo de 4 já garantido
     // por 4 bytes/pixel), então não tem padding de linha pra remover.
-    private static byte[] BitmapToBgraBytes(Bitmap bmp)
+    // Devolve um buffer ALUGADO do ArrayPool (não um array novo) — quem
+    // chama (VideoEncodeService.Feed) assume a posse e devolve sozinho.
+    //
+    // ANTES: "new byte[byteCount]" a cada quadro. A 1080p60 isso é ~500 MB/s
+    // de lixo pro coletor do .NET limpar, e as pausas dessa limpeza apareciam
+    // na transmissão como engasgada — sem NENHUMA relação com rede ou
+    // bitrate, o que explicava por que ajustar bitrate/fila de rede não
+    // resolvia sozinho.
+    private static (byte[] Buffer, int Length) BitmapToBgraBytes(Bitmap bmp)
     {
         var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
         var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
             int byteCount = data.Stride * data.Height;
-            byte[] bytes = new byte[byteCount];
+            byte[] bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(byteCount);
             Marshal.Copy(data.Scan0, bytes, 0, byteCount);
-            return bytes;
+            return (bytes, byteCount);
         }
         finally
         {
@@ -1835,7 +2493,6 @@ public partial class MainWindow : Window
         // servidor não responder.
         _failover?.Cancel();
         _peerMedia?.Stop();
-
         try
         {
             string code = TxtActiveCode.Text;
@@ -1878,11 +2535,23 @@ public partial class MainWindow : Window
         // Copia o CONVITE (endereço + código), não só o código. O código
         // sozinho não leva a lugar nenhum agora que a sala mora no PC de
         // alguém — quem recebesse só ele não teria como chegar.
-        string toCopy = string.IsNullOrWhiteSpace(_currentInvite)
+        string payload = string.IsNullOrWhiteSpace(_currentInvite)
             ? TxtActiveCode.Text
             : _currentInvite;
 
-        if (string.IsNullOrWhiteSpace(toCopy)) return;
+        if (string.IsNullOrWhiteSpace(payload)) return;
+
+        // Copia um LINK CLICÁVEL, não um texto pra digitar.
+        //
+        // Todo passo manual entre "recebi o convite" e "estou na sala" é um
+        // lugar onde alguém troca uma letra e conclui que o Vysor não achou a
+        // sala — já aconteceu aqui mesmo. Colado no Discord (ou em qualquer
+        // mensageiro), isto vira um clique que abre o app e entra sozinho.
+        //
+        // O código continua no texto, depois do link, de propósito: serve pra
+        // quem ainda não instalou o Vysor (o link não faria nada pra essa
+        // pessoa) e pra quem prefere digitar.
+        string toCopy = $"{VysorLink.Build(payload)}\n(ou entre com o código: {TxtActiveCode.Text})";
 
         for (int i = 0; i < 5; i++)
         {
@@ -1899,7 +2568,239 @@ public partial class MainWindow : Window
     }
 
     private void ListRecentRooms_SelectionChanged(object sender, SelectionChangedEventArgs e) { if (ListRecentRooms.SelectedItem is string code) TxtRoomCode.Text = code; }
-    private void TxtDisplayName_TextChanged(object sender, TextChangedEventArgs e) => UpdateLobbyButtons();
+    // Avisa o canal do Discord que a sala existe. Quem manda a mensagem é o
+    // SERVIDOR, pelo bot.
+    //
+    // POR QUE NÃO SAI MAIS DAQUI
+    // Antes a mensagem partia do próprio app, com um endereço de webhook
+    // embutido no programa. Funcionava, mas aquele endereço é um SEGREDO — quem
+    // o tem escreve o que quiser no canal, com qualquer nome e qualquer foto —
+    // e ele estava dentro de um instalador público, ao alcance de quem
+    // baixasse. Com o bot, o segredo mora só no servidor. Nenhuma máquina de
+    // usuário guarda nada, e trocar de canal não exige atualizar o app de
+    // ninguém.
+    //
+    // O "jeito de voltar" continua existindo, só que do lado de lá: sem as
+    // variáveis DISCORD_BOT_TOKEN e DISCORD_CHANNEL_ID, o servidor não anuncia
+    // e ninguém precisa mexer em nada aqui.
+    private async Task AnnounceRoomOnDiscordAsync(string code, string displayName)
+    {
+        if (!UserPrefs.LoadAnnounceEnabled()) return;
+
+        try
+        {
+            bool published = await _signalR.AnnounceRoomOnDiscordAsync(
+                displayName, UserPrefs.LoadChannel()?.Id);
+
+            if (!published) WarnDiscordSilent();
+        }
+        catch
+        {
+            WarnDiscordSilent();
+        }
+    }
+
+    // Uma vez por execução do app. O aviso é útil na primeira vez ("ué, não
+    // postou?") e vira barulho da terceira em diante — ainda mais pra quem
+    // simplesmente não usa a integração.
+    private bool _warnedDiscordSilent;
+
+    private void WarnDiscordSilent()
+    {
+        if (_warnedDiscordSilent) return;
+        _warnedDiscordSilent = true;
+
+        // A sala está aberta e funcionando: isto é um recado de canto, não um
+        // erro. Por isso vai na mesma faixa discreta dos outros recados, e não
+        // numa caixa que interrompe.
+        TxtStreamNotice.Text =
+            "Não avisei o Discord desta vez — o Vysor pode não estar instalado no servidor. " +
+            "A sala funciona normalmente; use o botão Copiar pra convidar.";
+        TxtStreamNotice.Visibility = Visibility.Visible;
+    }
+
+    // Abre a tela do Discord que instala o Vysor num servidor.
+    //
+    // O que ele pede é o MÍNIMO que dá pra pedir: entrar como aplicativo e
+    // poder escrever mensagem com link. Nada de ler conversas, nada de mexer
+    // em membro, nada de apagar coisa. Uma tela de permissão pedindo mais do
+    // que o necessário é o tipo de coisa que faz (com razão) o admin
+    // desconfiar e desistir.
+    //
+    // Só quem administra o servidor consegue concluir — o próprio Discord
+    // esconde da lista os servidores onde a pessoa não pode instalar
+    // aplicativos. Isso é dele, não nosso, e está certo assim.
+    // Pergunta ao servidor se o aviso no Discord realmente vai funcionar, e
+    // mostra a resposta na tela inicial.
+    //
+    // POR QUE NÃO BASTAVA MOSTRAR O QUE ESTÁ GUARDADO AQUI
+    // Todas as formas de isto quebrar são invisíveis do lado do app: alguém
+    // remove o Vysor do servidor do Discord, o token é regerado, o bot entra
+    // num segundo servidor. Em nenhum desses casos o computador daqui fica
+    // sabendo — e o app continuava anunciando com confiança um canal que já
+    // não existia mais.
+    //
+    // Roda em segundo plano e nunca atrapalha: se o servidor estiver dormindo,
+    // a resposta demora e o texto só se atualiza quando chegar.
+    private async Task CheckDiscordStatusAsync()
+    {
+        try
+        {
+            string? channelId = UserPrefs.LoadChannel()?.Id;
+            string url = "https://vysorserver-cjxi.onrender.com/discord/estado" +
+                         (string.IsNullOrEmpty(channelId) ? "" : $"?canal={Uri.EscapeDataString(channelId)}");
+
+            using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(90) };
+            string answer = (await http.GetStringAsync(url)).Trim();
+
+            int bar = answer.IndexOf('|');
+            if (bar <= 0) return;
+
+            string kind = answer[..bar];
+            string detail = answer[(bar + 1)..];
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (TxtAddBotHint == null) return;
+
+                if (kind == "ok")
+                {
+                    TxtAddBotHint.Text = $"✓ Confirmado: o convite vai pro canal #{detail}.";
+                    TxtAddBotHint.Foreground = new System.Windows.Media.SolidColorBrush(
+                        System.Windows.Media.Color.FromRgb(0x23, 0xA5, 0x5A));
+                }
+                else
+                {
+                    TxtAddBotHint.Text = $"⚠ O aviso no Discord não vai funcionar: {detail}";
+                    TxtAddBotHint.Foreground = new System.Windows.Media.SolidColorBrush(
+                        System.Windows.Media.Color.FromRgb(0xFA, 0xA6, 0x1A));
+                }
+            });
+        }
+        catch
+        {
+            // Sem internet, servidor fora do ar: fica o texto que já estava.
+            // Um erro de checagem não pode virar um alarme falso.
+        }
+    }
+
+    // Mostra qual canal está configurado, ou convida a configurar.
+    private void ShowChannelStatus()
+    {
+        if (TxtAddBotHint == null) return;
+
+        var channel = UserPrefs.LoadChannel();
+        TxtAddBotHint.Text = channel == null
+            // Este texto existe por causa de uma confusão real: quem NÃO
+            // administra o servidor clicava no botão, via uma lista vazia de
+            // servidores e concluía que estava tudo quebrado — quando na
+            // verdade não precisava fazer nada, porque o canal do grupo já
+            // cobre todo mundo. Só o admin precisa configurar, uma vez.
+            ? "Você não precisa fazer nada: o convite já vai pro canal do grupo. Isto é só pra quem ADMINISTRA um servidor e quer avisar em outro canal."
+            // "Canal escolhido", e não "Avisando em" — de propósito.
+            //
+            // O app guarda esta escolha aqui no computador e NÃO tem como saber
+            // se o Vysor continua instalado naquele servidor: quem descobre
+            // isso é o servidor, e só na hora de postar. Escrever "Avisando em
+            // #tal" era uma promessa que o app não podia cumprir — e ficava
+            // igualzinha depois de alguém remover o bot do Discord.
+            //
+            // Quando a publicação falha de verdade, quem avisa é a mensagem
+            // dentro da sala (ver AnnounceRoomOnDiscordAsync).
+            : $"Canal escolhido: #{channel.Value.Name}. Clique de novo pra trocar.";
+    }
+
+    // Descobre sozinho em qual servidor avisar.
+    //
+    // POR QUE ISTO EXISTE, sendo que já havia o botão de instalar
+    // Instalar é coisa de admin. Um membro comum não consegue — e ficava sem
+    // aviso nenhum, mesmo estando no mesmo grupo com o bot instalado ali do
+    // lado. Aqui ele entra com a conta dele UMA VEZ e o Vysor cruza os
+    // servidores dele com os servidores onde o bot está. Achou, pronto: nem
+    // escolher canal, nem ser admin, nem digitar nada.
+    //
+    // "response_type=token" evita guardar um segredo do aplicativo no servidor:
+    // a autorização volta direto pro navegador da pessoa, e o cruzamento
+    // acontece lá mesmo (ver /discord/conectar). A lista de servidores dela
+    // nunca chega ao nosso servidor.
+    private void BtnConnectDiscord_Click(object sender, RoutedEventArgs e)
+    {
+        const string url =
+            "https://discord.com/oauth2/authorize" +
+            "?client_id=1543678716817842326" +
+            "&response_type=token" +
+            "&scope=identify%20guilds" +
+            "&redirect_uri=https%3A%2F%2Fvysorserver-cjxi.onrender.com%2Fdiscord%2Fconectar";
+
+        OpenInBrowser(url, "Abri o Discord no navegador. Autorize e eu descubro o resto sozinho.");
+    }
+
+    private void OpenInBrowser(string url, string okMessage)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            TxtAddBotHint.Text = okMessage;
+            TxtAddBotHint.Foreground = new System.Windows.Media.SolidColorBrush(
+                System.Windows.Media.Color.FromRgb(0xA1, 0xA1, 0xAA));
+        }
+        catch
+        {
+            // Sem navegador padrão: em vez de não acontecer nada, deixa o
+            // endereço pronto pra colar.
+            try { Clipboard.SetText(url); } catch { }
+            TxtAddBotHint.Text = "Não consegui abrir o navegador — copiei o link, cole na barra de endereços.";
+        }
+    }
+
+    private void BtnAddBot_Click(object sender, RoutedEventArgs e)
+    {
+        // O "redirect_uri" é o que fecha o ciclo: terminada a autorização, o
+        // Discord manda a pessoa pra uma página nossa que lista os canais
+        // daquele servidor. Sem ele, ela voltaria pra uma tela genérica do
+        // Discord e ainda teria que descobrir e digitar um número de canal.
+        // As permissões pedidas, somadas: 1024 ver canais + 2048 enviar
+        // mensagens + 16384 inserir links = 19456.
+        //
+        // "Ver canais" ESTAVA FALTANDO e não é detalhe: sem ela o bot entra no
+        // servidor e não enxerga canal nenhum — não consegue listar pra você
+        // escolher, nem postar depois. Ele fica lá, aparentemente instalado, e
+        // simplesmente nada acontece.
+        //
+        // Continua sendo o mínimo: ver os canais, escrever e deixar o link
+        // virar prévia. Nada de ler conversas, mexer em membros ou apagar.
+        const string url =
+            "https://discord.com/oauth2/authorize" +
+            "?client_id=1543678716817842326&permissions=19456&scope=bot" +
+            "&response_type=code" +
+            "&redirect_uri=https%3A%2F%2Fvysorserver-cjxi.onrender.com%2Fdiscord%2Finstalado";
+
+        OpenInBrowser(url, "Abri o Discord no navegador. Escolha o servidor e autorize.");
+    }
+
+    private void ChkDiscordAnnounce_Changed(object sender, RoutedEventArgs e)
+    {
+        if (ChkDiscordAnnounce == null) return;   // ainda montando a janela
+
+        bool on = ChkDiscordAnnounce.IsChecked == true;
+        UserPrefs.SaveAnnounceEnabled(on);
+
+        // Religou: reconfere na hora, pra o texto não ficar mostrando um
+        // estado velho de quando estava desligado.
+        if (on) _ = CheckDiscordStatusAsync();
+        else ShowChannelStatus();
+    }
+
+    private void TxtDisplayName_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        UpdateLobbyButtons();
+
+        // Lembra o nome pra próxima vez. É o que faz um convite clicado com o
+        // app fechado conseguir entrar sozinho, em vez de parar aqui pedindo
+        // pra digitar de novo (ver UserPrefs).
+        UserPrefs.SaveDisplayName(TxtDisplayName?.Text);
+    }
+
     private void TxtRoomCode_TextChanged(object sender, TextChangedEventArgs e) => UpdateLobbyButtons();
 
     // Liga/desliga os botões da tela inicial conforme o que já foi preenchido.
@@ -2034,6 +2935,24 @@ public partial class MainWindow : Window
     // *encobertos* (o termo do Windows é "cloaked"). Era por isso que a lista
     // vinha cheia de janelas fantasma, com miniatura preta, de programas que
     // nem estavam abertos.
+    // Nome do programa dono da janela, pra servir de título quando a janela não
+    // tem um. Nunca lança: processo que morreu entre a enumeração e esta
+    // consulta é normal, e vale mais pular essa janela do que quebrar a lista.
+    private static string ProcessNameOf(uint pid)
+    {
+        try
+        {
+            using var proc = Process.GetProcessById((int)pid);
+            return proc.ProcessName ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private void BtnRefreshSources_Click(object sender, RoutedEventArgs e) => _ = LoadSourcesAsync();
+
     private List<WindowHandle> GetOpenWindows()
     {
         List<WindowHandle> windows = new();
@@ -2068,12 +2987,30 @@ public partial class MainWindow : Window
                 if (rect.Right - rect.Left < 80 || rect.Bottom - rect.Top < 80) return true;
 
                 int length = GetWindowTextLength(hWnd);
-                if (length <= 0) return true;
+                string title = "";
 
-                StringBuilder sb = new StringBuilder(length + 1);
-                GetWindowText(hWnd, sb, sb.Capacity);
-                string title = sb.ToString();
-                if (string.IsNullOrWhiteSpace(title)) return true;
+                if (length > 0)
+                {
+                    StringBuilder sb = new StringBuilder(length + 1);
+                    GetWindowText(hWnd, sb, sb.Capacity);
+                    title = sb.ToString().Trim();
+                }
+
+                // SEM TÍTULO NÃO É MOTIVO PRA SUMIR DA LISTA.
+                //
+                // Antes, janela sem título era descartada — e jogo é justamente
+                // o caso em que isso acontece: vários só definem o título depois
+                // de terminar de carregar, e alguns nunca definem. O resultado
+                // era o jogo simplesmente não aparecer na aba Janelas, sem
+                // nenhuma explicação, enquanto todo o resto aparecia.
+                //
+                // Agora, faltando o título, usamos o nome do programa. Um item
+                // escrito "deadlock" é infinitamente melhor que item nenhum.
+                if (title.Length == 0)
+                {
+                    title = ProcessNameOf(pid);
+                    if (title.Length == 0) return true;   // nem isso: aí sim desiste
+                }
 
                 windows.Add(new WindowHandle { Title = title, hWnd = hWnd });
             }
@@ -2128,6 +3065,54 @@ public partial class MainWindow : Window
     private int _blankPrintWindowFrames;
     private int _captureInspectCounter;
 
+    // Assinatura do último quadro examinado, pra perceber imagem congelada.
+    private long _lastFrameStamp;
+    private int _frozenFrames;
+    private bool _suggestedFullScreen;
+
+    // Uma vez por transmissão. Vem da thread de captura, então volta pra
+    // interface antes de mexer na tela.
+    private void SuggestFullScreenShare()
+    {
+        if (_suggestedFullScreen) return;
+        _suggestedFullScreen = true;
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            TxtStreamNotice.Text =
+                "A imagem desta janela está parada. Jogos que desenham direto na placa de vídeo " +
+                "não podem ser capturados por janela — pare e compartilhe em \"Tela Inteira\", " +
+                "que funciona com jogos.";
+            TxtStreamNotice.Visibility = Visibility.Visible;
+        });
+    }
+
+    // Resumo barato de um quadro: amostra alguns pixels espalhados em vez de
+    // percorrer os milhões que uma tela tem. Não precisa ser à prova de
+    // colisão — só distinguir "mudou" de "não mudou". Ler a imagem inteira 60
+    // vezes por segundo custaria mais que a captura em si.
+    private static long FrameStamp(Bitmap bmp)
+    {
+        try
+        {
+            long hash = 17;
+            int stepX = Math.Max(1, bmp.Width / 12);
+            int stepY = Math.Max(1, bmp.Height / 12);
+
+            for (int y = stepY / 2; y < bmp.Height; y += stepY)
+                for (int x = stepX / 2; x < bmp.Width; x += stepX)
+                    hash = hash * 31 + bmp.GetPixel(x, y).ToArgb();
+
+            return hash;
+        }
+        catch
+        {
+            // Devolve algo sempre diferente: na dúvida, é melhor NÃO concluir
+            // que a imagem congelou do que trocar de estratégia à toa.
+            return Environment.TickCount64;
+        }
+    }
+
     private Bitmap? CaptureWindow(IntPtr hWnd)
     {
         if (!GetWindowRect(hWnd, out RECT rect)) return null;
@@ -2141,7 +3126,33 @@ public partial class MainWindow : Window
 
         if (_windowCaptureStrategy == WindowCaptureStrategy.ScreenRegion)
         {
-            return CaptureScreenRegion(rect, width, height);
+            var shot = CaptureScreenRegion(rect, width, height);
+
+            // Já trocamos de estratégia e a imagem CONTINUA parada. Aqui não há
+            // mais o que tentar por conta própria: um jogo em tela cheia
+            // exclusiva desenha direto na placa, e nenhuma captura por janela
+            // alcança isso. Quem resolve é compartilhar "Tela Inteira", que usa
+            // outro mecanismo (o mesmo do ffmpeg, por duplicação de área de
+            // trabalho) e enxerga jogos.
+            //
+            // Avisar é obrigatório: sem isto a pessoa fica transmitindo uma
+            // imagem congelada com o áudio funcionando, e quem assiste acha que
+            // a internet caiu.
+            if (shot != null && (++_captureInspectCounter % 30) == 0)
+            {
+                long stamp = FrameStamp(shot);
+                if (stamp == _lastFrameStamp)
+                {
+                    if (++_frozenFrames >= 6) SuggestFullScreenShare();
+                }
+                else
+                {
+                    _frozenFrames = 0;
+                    _lastFrameStamp = stamp;
+                }
+            }
+
+            return shot;
         }
 
         // Todo o preenchimento fica dentro do try: se algo falhar no meio
@@ -2177,6 +3188,43 @@ public partial class MainWindow : Window
             // pagar essa checagem 60 vezes por segundo.
             bool shouldInspect = _windowCaptureStrategy == WindowCaptureStrategy.Auto
                                  || (++_captureInspectCounter % 30) == 0;
+
+            // IMAGEM PARADA É TÃO RUIM QUANTO IMAGEM VAZIA — e não era detectada.
+            //
+            // Um jogo que desenha por Vulkan/DirectX pode devolver ao
+            // PrintWindow um quadro PERFEITAMENTE VÁLIDO, mas sempre o mesmo:
+            // o último que o Windows compôs antes de o jogo assumir o
+            // desenho. Quem assiste vê a imagem congelada com o áudio
+            // rodando normalmente — foi exatamente o relato do Deadlock. E a
+            // pista que confirma: ao sair do jogo por alt-tab, o Windows volta
+            // a compor a janela e a imagem destrava sozinha.
+            //
+            // "LooksBlank" nunca pegaria isso, porque o quadro não está vazio.
+            // O que denuncia é ele ser IDÊNTICO ao anterior por vários
+            // segundos seguidos.
+            if (success && shouldInspect && !LooksBlank(bmp))
+            {
+                long stamp = FrameStamp(bmp);
+                if (stamp == _lastFrameStamp)
+                {
+                    // A cada 30 quadros conferimos um: 6 iguais seguidos são
+                    // ~3 segundos de imagem parada a 60fps. Tela realmente
+                    // estática (um documento aberto) também cai aqui — e sem
+                    // problema, porque o recorte de tela mostra a mesma coisa.
+                    if (++_frozenFrames >= 6)
+                    {
+                        _windowCaptureStrategy = WindowCaptureStrategy.ScreenRegion;
+                        _frozenFrames = 0;
+                        bmp.Dispose();
+                        return CaptureScreenRegion(rect, width, height);
+                    }
+                }
+                else
+                {
+                    _frozenFrames = 0;
+                    _lastFrameStamp = stamp;
+                }
+            }
 
             if (success && !(shouldInspect && LooksBlank(bmp)))
             {

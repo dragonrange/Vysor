@@ -160,6 +160,13 @@ public static class LocalServer
         });
 
         services.AddSingleton<RoomManager>();
+
+        // O RoomHub é o MESMO arquivo do servidor (ver VysorClient.csproj), e
+        // agora ele depende do avisador do Discord. Aqui ele entra sem token
+        // nenhum e fica inerte de propósito: uma sala hospedada no PC de
+        // alguém não tem por que sair anunciando no canal do grupo, e o
+        // segredo do bot não pode existir na máquina de ninguém.
+        services.AddSingleton<DiscordAnnouncer>();
         services.AddHostedService<RoomSweeper>();
     }
 

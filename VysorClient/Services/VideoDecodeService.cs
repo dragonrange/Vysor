@@ -46,6 +46,12 @@ public class VideoDecodeService
     // vimos, os quadros que chegam não têm como ser decodificados (ver Feed).
     private volatile bool _sawKeyframe;
 
+    // Desde quando estamos esperando um quadro-chave por causa de uma
+    // ressincronia (0 = não é ressincronia, é o início normal da transmissão,
+    // que espera o tempo que for). Ver a válvula de segurança em Feed().
+    private long _waitingSince;
+    private const long ResyncPatienceMs = 2000;
+
     public bool Start()
     {
         if (!FfmpegLocator.IsAvailable) return false;
@@ -168,22 +174,88 @@ public class VideoDecodeService
         // vem no máximo 1 segundo depois.
         if (!_sawKeyframe)
         {
-            if (!IsKeyframe(accessUnit)) return;
+            // VÁLVULA DE SEGURANÇA. Um quadro-chave é o maior de todos (vira
+            // ~100 pacotes), então é justamente o mais provável de perder um
+            // pedaço no caminho. Numa rede muito ruim dá pra imaginar o caso
+            // em que quadro-chave nenhum chega inteiro — e aí, esperando em
+            // silêncio, a imagem ficaria congelada pra sempre sem nenhum aviso.
+            //
+            // Passado esse tempo, aceitamos o que vier. A imagem pode sair
+            // suja por um instante, mas volta a se mexer e se recompõe sozinha
+            // no primeiro quadro-chave que chegar inteiro. Imagem imperfeita é
+            // ruim; imagem parada sem explicação é pior.
+            if (!IsKeyframe(accessUnit))
+            {
+                if (_waitingSince == 0 ||
+                    Environment.TickCount64 - _waitingSince < ResyncPatienceMs) return;
+            }
             _sawKeyframe = true;
+            _waitingSince = 0;
         }
 
         try
         {
             if (!_pendingUnits.TryAdd(accessUnit))
             {
-                _pendingUnits.TryTake(out _);
-                _pendingUnits.TryAdd(accessUnit);
+                // Fila cheia: o decodificador não está dando conta.
+                //
+                // Antes a gente descartava o quadro mais antigo e enfiava o
+                // novo no lugar. Parecia razoável ("perde um quadro, segue a
+                // vida") e era justamente o contrário: tirar um quadro do MEIO
+                // da fila quebra a corrente do H.264, e todos os quadros
+                // seguintes passam a ser decodificados a partir de uma imagem
+                // que não existe — saem com rastro do quadro anterior grudado.
+                //
+                // O certo é assumir a perda de vez: joga fora o que estava na
+                // fila e volta a esperar um quadro-chave. Custa uma pausa de
+                // no máximo ~250ms (é o intervalo entre quadros-chave) em
+                // troca de imagem limpa quando volta.
+                RequestResync();
             }
         }
         catch
         {
             // Fila encerrada (Stop em andamento) — ignora.
         }
+    }
+
+    // Descarta o que está na fila e volta a ignorar tudo até o próximo
+    // quadro-chave.
+    //
+    // Chamado quando se sabe que a corrente de quadros foi quebrada — seja
+    // por perda na rede (ver PeerTransport.OnVideoLoss) ou por não termos dado
+    // conta de decodificar tudo. Continuar decodificando depois de um buraco
+    // não devolve "um quadro a menos": devolve imagem ERRADA, com pedaços do
+    // quadro velho misturados nos novos, até o próximo quadro-chave chegar
+    // sozinho. Melhor a imagem congelar por um instante do que borrar.
+    //
+    // Chamar isto várias vezes seguidas é inofensivo: depois da primeira, a
+    // fila já está vazia e só o que muda é continuar esperando o quadro-chave.
+    // Quantas vezes esta telinha teve que jogar a fila fora e esperar um novo
+    // quadro-chave. É o melhor indicador de "chegou lixo": cada uma dessas é
+    // uma pausa visível de até ~250ms na imagem. Se este número sobe junto com
+    // a engasgada, o problema chegou pela rede ou o decodificador não venceu;
+    // se fica parado, a engasgada é da tela (interface), não do vídeo.
+    public long Resyncs => Interlocked.Read(ref _resyncs);
+    private long _resyncs;
+
+    // Quadros que saíram decodificados de verdade, pra medir os fps REAIS
+    // chegando nesta telinha.
+    public long DecodedFrames => Interlocked.Read(ref _decodedFrames);
+    private long _decodedFrames;
+
+    public void RequestResync()
+    {
+        if (!_sawKeyframe) return;   // já estamos esperando: não reinicia a espera
+
+        Interlocked.Increment(ref _resyncs);
+        _sawKeyframe = false;
+        _waitingSince = Math.Max(1, Environment.TickCount64);
+        try
+        {
+            while (_pendingUnits.TryTake(out _)) { }
+        }
+        catch { }
     }
 
     // Um quadro-chave (IDR) é o único que se explica sozinho — é por ele que
@@ -252,6 +324,7 @@ public class VideoDecodeService
 
         _buf = new byte[1 << 16];
         _bufLen = 0;
+        _waitingSince = 0;
     }
 
     private static void JoinQuietly(Thread? thread)
@@ -379,6 +452,7 @@ public class VideoDecodeService
 
             byte[] frame = new byte[fileSize];
             Buffer.BlockCopy(_buf, offset, frame, 0, (int)fileSize);
+            Interlocked.Increment(ref _decodedFrames);
             try { OnFrameDecoded?.Invoke(frame); } catch { }
 
             offset += (int)fileSize;

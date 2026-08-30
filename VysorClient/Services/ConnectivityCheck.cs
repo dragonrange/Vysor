@@ -111,30 +111,6 @@ public static class ConnectivityCheck
         return Decide(publicIp, forward, lanIp, tailscaleIp, port) with { Nat = nat };
     }
 
-    // Um resumo de uma linha, feito pra caber num print de tela e ser
-    // comparado entre várias pessoas do grupo.
-    public static string ShortSummary(Report report)
-    {
-        string hospedar = report.Verdict switch
-        {
-            Verdict.ReachableFromInternet => "posso hospedar: SIM",
-            Verdict.BlockedByCarrier => "posso hospedar: NÃO (operadora)",
-            Verdict.RouterRefused => "posso hospedar: NÃO (roteador recusa)",
-            Verdict.RouterNotFound => "posso hospedar: NÃO (roteador mudo)",
-            _ => "posso hospedar: ?"
-        };
-
-        string direta = report.Nat?.Kind switch
-        {
-            NatBehavior.Kind.DirectConnectionPossible => "conexão direta: SIM",
-            NatBehavior.Kind.NeedsBridge => "conexão direta: NÃO (precisa de ponte)",
-            NatBehavior.Kind.Blocked => "conexão direta: bloqueada",
-            _ => "conexão direta: ?"
-        };
-
-        return hospedar + "  |  " + direta;
-    }
-
     // A decisão em si, separada da parte de rede de propósito: assim ela pode
     // ser testada com todos os cenários (inclusive os que eu não consigo
     // reproduzir aqui, como uma operadora com CGNAT) antes de chegar no seu PC.

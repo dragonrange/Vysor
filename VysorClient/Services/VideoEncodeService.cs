@@ -70,8 +70,14 @@ public class VideoEncodeService
     // Fila de frames crus esperando pra entrar no ffmpeg. Limitada de
     // propósito: vídeo é descartável, e é melhor perder um frame do que
     // travar a captura.
-    private readonly BlockingCollection<byte[]> _pendingFrames =
-        new(new ConcurrentQueue<byte[]>(), boundedCapacity: 3);
+    //
+    // Capacidade 3 (~50ms a 60fps) era curta demais: qualquer engasgo
+    // momentâneo do encoder — a GPU ocupada com o próprio jogo sendo
+    // compartilhado, por exemplo — já estourava a fila e derrubava frame na
+    // hora. 10 frames (~166ms a 60fps) absorve esses picos sem acumular
+    // atraso perceptível numa transmissão ao vivo.
+    private readonly BlockingCollection<(byte[] Buffer, int Length)> _pendingFrames =
+        new(new ConcurrentQueue<(byte[], int)>(), boundedCapacity: 10);
 
     // --- Nível 1: tela cheia, 100% GPU (ddagrab + NVENC) --------------------
 
@@ -87,7 +93,7 @@ public class VideoEncodeService
             "-hide_banner -loglevel warning " +
             "-init_hw_device d3d11va " +
             $"-filter_complex \"ddagrab=output_idx={monitorIndex}:framerate={fps}\" " +
-            $"-c:v h264_nvenc -preset p1 -tune ull -rc cbr -zerolatency 1 {BitrateFlags(outputWidth, outputHeight, fps)} " +
+            $"-c:v h264_nvenc -preset {NvencPreset} -tune ull -rc cbr -zerolatency 1 {BitrateFlags(outputWidth, outputHeight, fps)} " +
             $"-bf 0 -g {KeyframeInterval(fps)} -f h264 pipe:1";
 
         var psi = BuildPsi(args, redirectStdin: false);
@@ -132,9 +138,9 @@ public class VideoEncodeService
 
         (string encoder, string flags, string label)[] attempts =
         {
-            ("h264_nvenc", $"-preset p1 -tune ull -rc cbr -zerolatency 1 {rate}", "NVENC"),
-            ("h264_qsv", $"-preset veryfast -low_delay_brc 1 -look_ahead 0 {rate}", "Quick Sync"),
-            ("h264_amf", $"-usage ultralowlatency -rc cbr -quality speed {rate}", "AMF"),
+            ("h264_nvenc", $"-preset {NvencPreset} -tune ull -rc cbr -zerolatency 1 {rate}", "NVENC"),
+            ("h264_qsv", $"-preset faster -low_delay_brc 1 -look_ahead 0 {rate}", "Quick Sync"),
+            ("h264_amf", $"-usage ultralowlatency -rc cbr -quality balanced {rate}", "AMF"),
         };
 
         foreach (var (encoder, flags, label) in attempts)
@@ -188,44 +194,126 @@ public class VideoEncodeService
     private static string BitrateFlags(int width, int height, int fps)
     {
         double pixelsPerSecond = (double)width * height * Math.Max(1, fps);
-        int kbps = (int)(pixelsPerSecond * 0.07 / 1000.0);
-        kbps = Math.Clamp(kbps, 1500, 10000);
+        int kbps = (int)(pixelsPerSecond * BitsPerPixel / 1000.0);
+        kbps = Math.Clamp(kbps, 2500, 20000);
 
         // O "bufsize" controla quanto a taxa pode oscilar antes de ser
-        // corrigida. Um quarto de segundo mantém a latência baixa (importante
-        // pra transmissão ao vivo) e ainda absorve bem as cenas de movimento.
-        int bufsize = Math.Max(500, kbps / 4);
+        // corrigida.
+        //
+        // Era um quarto de segundo, e isso é apertado demais pra jogo. Numa
+        // cena parada o codificador não usa o orçamento inteiro; numa explosão
+        // ele precisaria de bem mais que a média por um instante. Com a janela
+        // curta ele é obrigado a devolver a conta quase quadro a quadro, então
+        // o pico é cortado na hora e é justamente aí que a imagem some em
+        // borrão. Meio segundo deixa ele guardar o que sobrou da cena parada e
+        // gastar no momento difícil, que é exatamente o comportamento que se
+        // quer. Continua curto o bastante pra não criar atraso perceptível.
+        int bufsize = Math.Max(1000, kbps / 2);
 
         return $"-b:v {kbps}k -maxrate {kbps}k -bufsize {bufsize}k";
     }
 
-    // Intervalo entre quadros-chave. Um quadro-chave é o único ponto em que
-    // quem começa a assistir no meio da transmissão consegue "entrar" no
-    // vídeo — até chegar um, a tela da pessoa fica preta. Por isso mandamos
-    // um por segundo (e não a cada 2s, como antes): custa um pouco mais de
-    // banda, mas corta pela metade o tempo de espera de quem abre a sua
-    // transmissão.
-    private static int KeyframeInterval(int fps) => Math.Max(2, fps);
+    // Bits por pixel por segundo — o "quanto de detalhe cabe" da transmissão.
+    //
+    // Era 0,07, valor pensado pra tela de trabalho: janela parada, texto, muita
+    // área que não muda de um quadro pro outro. Isso comprime muito bem e 0,07
+    // basta com folga.
+    //
+    // JOGO É OUTRO CONTEÚDO. Em Warframe (ou qualquer coisa frenética) a tela
+    // inteira muda todo quadro, com partículas, fogo e brilho — que é o pior
+    // caso possível pra compressão, porque quase nada pode ser reaproveitado do
+    // quadro anterior. Com 0,07 o resultado a 1080p60 eram ~8,7 Mbps, que dá
+    // conta de uma planilha e não dá conta de uma explosão: o codificador
+    // cumpre a meta do jeito que ele sabe, borrando o detalhe.
+    //
+    // 0,12 põe 1080p60 em ~15 Mbps, que é a faixa que as plataformas de
+    // transmissão de jogo recomendam pra esse formato. Como é P2P, essa banda
+    // sai direto de uma casa pra outra, sem custo de servidor.
+    private const double BitsPerPixel = 0.12;
+
+    // Esforço do codificador da Nvidia. É a melhoria que NÃO custa banda: com
+    // a mesma taxa de bits, um preset mais caprichoso procura melhor o que
+    // reaproveitar entre um quadro e outro e devolve imagem visivelmente mais
+    // limpa — de novo, ganho maior justamente em cena com muito movimento.
+    //
+    // Estava em "p1", que é o mais apressado dos sete. Ele existe pra caso de
+    // latência extrema (jogar remotamente, por exemplo), não pra assistir
+    // alguém jogar, e a diferença de tempo entre p1 e p4 num 1080p60 é de
+    // poucos milissegundos numa placa moderna — muito abaixo dos 16ms que cada
+    // quadro tem. "p4" é o meio-termo, o mesmo que o OBS usa por padrão.
+    //
+    // Se em alguma placa antiga isto ficar pesado, é a primeira coisa a voltar
+    // atrás: o encoder atrasado descarta quadro (ver a fila em Feed) e o
+    // sintoma seria imagem limpa porém com menos quadros por segundo.
+    private const string NvencPreset = "p4";
+
+    // Intervalo entre quadros-chave.
+    //
+    // Um quadro-chave não é só "o ponto em que quem chega no meio da
+    // transmissão consegue entrar" — é também o ÚNICO ponto de recuperação
+    // depois de perder um pacote. Com "-bf 0" (sem quadros B), a decodificação
+    // é uma corrente: P depende do quadro anterior, que depende do anterior,
+    // até o último quadro-chave. Perder UM pacote de UM quadro no meio da
+    // corrente corrompe a imagem até o próximo quadro-chave chegar — com um
+    // quadro-chave por segundo, isso podia significar até 1 segundo inteiro de
+    // imagem quebrada por causa de uma perda pontual.
+    //
+    // A boa notícia: com "-rc cbr", o total de bits por segundo é fixo pelo
+    // "-maxrate" (ver BitrateFlags) — mais quadros-chave não aumenta a banda
+    // usada, só REDISTRIBUI o mesmo orçamento (um pouco menos nítido quadro a
+    // quadro, pra sobrar mais pros quadros-chave). Ou seja: dá pra encurtar
+    // bastante esse intervalo de graça. Um quarto de segundo entre
+    // quadros-chave limita qualquer perda a, no máximo, ~250ms de imagem
+    // ruim, em vez de até 1 segundo inteiro.
+    private static int KeyframeInterval(int fps) => Math.Max(2, fps / 4);
 
     // Só válido depois de StartRawPipeHardware ter retornado true. Nunca
     // bloqueia: se a fila estiver cheia (encoder não está dando conta), o
     // frame mais antigo que ainda não entrou é descartado e o novo entra no
     // lugar.
-    public void Feed(byte[] bgraFrame)
+    //
+    // "buffer" TEM que vir de ArrayPool<byte>.Shared.Rent (ver
+    // MainWindow.BitmapToBgraBytes) — este método assume posse dele e o
+    // devolve ao pool sozinho (seja depois de mandar pro ffmpeg, seja ao
+    // descartá-lo por fila cheia). Alocar um array novo a cada quadro — o
+    // que fazíamos antes — vira ~500 MB/s de lixo a 1080p60, e as pausas do
+    // coletor de lixo do .NET pra limpar isso apareciam na tela como
+    // engasgada, sem nenhuma relação com rede.
+    // Quantos quadros a CAPTURA produziu e o codificador não deu conta de
+    // engolir. É o número que diz "o problema começa aqui, no remetente" —
+    // sem ele, um encoder que não vence a carga (GPU quente no meio de um jogo
+    // pesado, por exemplo) é indistinguível de perda de rede do outro lado.
+    public long DroppedFrames => Interlocked.Read(ref _droppedFrames);
+    private long _droppedFrames;
+
+    // Quantos quadros saíram codificados de verdade. Comparado com o tempo,
+    // dá os quadros por segundo REAIS — que é o que importa, não o que foi
+    // pedido no modal.
+    public long EncodedFrames => Interlocked.Read(ref _encodedFrames);
+    private long _encodedFrames;
+
+    public void Feed(byte[] buffer, int length)
     {
-        if (!_running) return;
+        if (!_running)
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            return;
+        }
 
         try
         {
-            if (!_pendingFrames.TryAdd(bgraFrame))
+            if (!_pendingFrames.TryAdd((buffer, length)))
             {
-                _pendingFrames.TryTake(out _);
-                _pendingFrames.TryAdd(bgraFrame);
+                if (_pendingFrames.TryTake(out var dropped))
+                    System.Buffers.ArrayPool<byte>.Shared.Return(dropped.Buffer);
+                Interlocked.Increment(ref _droppedFrames);
+                _pendingFrames.TryAdd((buffer, length));
             }
         }
         catch
         {
-            // Fila já encerrada (Stop em andamento) — só ignora.
+            // Fila já encerrada (Stop em andamento).
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -388,11 +476,24 @@ public class VideoEncodeService
         try
         {
             var stdin = proc.StandardInput.BaseStream;
-            foreach (var frame in _pendingFrames.GetConsumingEnumerable())
+            foreach (var (buffer, length) in _pendingFrames.GetConsumingEnumerable())
             {
+                try
+                {
+                    if (_running)
+                    {
+                        stdin.Write(buffer, 0, length);
+                        stdin.Flush();
+                    }
+                }
+                finally
+                {
+                    // Sempre devolve, escreveu ou não — é o que fecha o
+                    // ciclo do buffer emprestado por BitmapToBgraBytes.
+                    System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+                }
+
                 if (!_running) break;
-                stdin.Write(frame, 0, frame.Length);
-                stdin.Flush();
             }
         }
         catch
@@ -551,6 +652,7 @@ public class VideoEncodeService
         byte[] au = new byte[len];
         Buffer.BlockCopy(_buf, from, au, 0, len);
 
+        Interlocked.Increment(ref _encodedFrames);
         try { OnEncodedFrame?.Invoke(au); } catch { }
 
         CompactBuffer(from);

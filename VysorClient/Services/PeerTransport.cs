@@ -53,7 +53,36 @@ public class PeerTransport : IDisposable
     private sealed class Peer
     {
         public required string UserId { get; init; }
-        public required FrameReassembler Reassembler { get; init; }
+
+        // DOIS remontadores, um pra cada tipo — e isto NÃO é detalhe de
+        // organização, é a correção de um bug que destruía a imagem.
+        //
+        // O QUE ACONTECIA COM UM SÓ
+        // Cada quadro leva um número de série, e o remontador ignora tudo que
+        // chega com número MENOR que o último quadro que ele entregou (é o que
+        // impede pedaços atrasados de reabrirem a montagem de um quadro velho).
+        // Só que o número de série é um contador único, compartilhado por vídeo
+        // E áudio — e áudio sai na frente do vídeo de propósito (fila separada,
+        // sem espera; ver SendLoop), justamente pra voz não engasgar.
+        //
+        // Resultado: o áudio, saindo depois mas chegando antes, "carimbava" um
+        // número mais alto no remontador. Os pedaços do quadro de vídeo que
+        // ainda estavam a caminho chegavam com número menor e eram jogados
+        // fora como se fossem atrasados. O quadro de vídeo nunca completava.
+        //
+        // E isso acontecia com quase TODO quadro grande: um quadro-chave vira
+        // ~100 pacotes espaçados por dezenas de milissegundos, tempo de sobra
+        // pra vários pedaços de áudio passarem na frente. Daí os três sintomas
+        // relatados juntos e sempre nessa combinação: imagem engasgando,
+        // quadro anterior "mesclando" com os seguintes (corrente H.264 quebrada
+        // por quadro faltando) — e o ÁUDIO PERFEITO, porque o áudio era
+        // justamente quem ganhava a corrida e nunca era descartado.
+        //
+        // Com um remontador por tipo, cada um tem a sua própria contagem e um
+        // não interfere no outro. O formato dos pacotes não muda em nada.
+        public required FrameReassembler VideoReassembler { get; init; }
+        public required FrameReassembler AudioReassembler { get; init; }
+
         public List<IPEndPoint> Candidates { get; } = new();
         public IPEndPoint? Confirmed { get; set; }
         public DateTime LastHeard { get; set; }
@@ -84,6 +113,12 @@ public class PeerTransport : IDisposable
 
     // Um amigo passou a estar (ou deixou de estar) alcançável direto.
     public event Action<string, bool>? OnPeerStateChanged;
+
+    // Um quadro de VÍDEO deste amigo se perdeu no caminho. Ver o comentário
+    // grande em FrameReassembler.TakeLoss: seguir decodificando depois de uma
+    // perda produz imagem borrada/com rastro do quadro anterior, então quem
+    // ouve isto deve pedir ressincronia ao decodificador.
+    public event Action<string>? OnVideoLoss;
 
     // Amigo com indício de mesma rede que não conseguiu furar o NAT depois de
     // um tempo razoável. Ver SameNetworkStuckAfter.
@@ -172,7 +207,8 @@ public class PeerTransport : IDisposable
         var peer = _peers.GetOrAdd(userId, id => new Peer
         {
             UserId = id,
-            Reassembler = new FrameReassembler(_roomKey),
+            VideoReassembler = new FrameReassembler(_roomKey),
+            AudioReassembler = new FrameReassembler(_roomKey),
             LastHeard = DateTime.UtcNow
         });
 
@@ -226,15 +262,31 @@ public class PeerTransport : IDisposable
         // pior dos mundos: os pedaços enviados são inúteis sem os que ficaram
         // de fora (o quadro é descartado do outro lado de qualquer jeito) e
         // ainda teriam gasto banda à toa.
+        //
+        // Vídeo e áudio têm filas SEPARADAS de propósito — mesmo raciocínio
+        // que já valia quando o servidor ainda repassava mídia (ver
+        // RoomManager.cs no histórico): um quadro-chave de vídeo a 60fps
+        // pode virar mais de cem pacotes de uma vez, e numa fila única eles
+        // enfileiravam NA FRENTE de qualquer pedaço de áudio que chegasse
+        // logo depois. Resultado observado: o amigo via a imagem engasgar E
+        // ficava sem áudio nenhum, porque o áudio nunca conseguia furar a
+        // fila de vídeo (ou nem entrava mais, com a fila cheia). Áudio é uma
+        // fração do tamanho do vídeo (bem menos de 1 Mbps mesmo em qualidade
+        // alta) — separar as filas custa quase nada e evita esse
+        // atropelamento por completo.
+        bool isAudio = kind == PeerPacket.KindAudio;
+        var queue = isAudio ? _audioOutbound : _videoOutbound;
+        int max = isAudio ? MaxQueuedAudioPackets : MaxQueuedVideoPackets;
+
         lock (_outboundLock)
         {
-            if (_outbound.Count + packets.Count > MaxQueuedPackets)
+            if (queue.Count + packets.Count > max)
             {
                 DroppedFrames++;
                 return;
             }
 
-            foreach (var packet in packets) _outbound.Enqueue(new Outgoing(target, packet));
+            foreach (var packet in packets) queue.Enqueue(new Outgoing(target, packet));
         }
 
         _hasWork.Set();
@@ -264,20 +316,77 @@ public class PeerTransport : IDisposable
     // "dormir", então não depende do relógio grosso do sistema.
     private readonly record struct Outgoing(IPEndPoint Target, byte[] Packet);
 
-    private readonly Queue<Outgoing> _outbound = new();
+    // Duas filas, de propósito (ver o comentário grande em Send()): áudio
+    // sempre passa na frente, e nunca espera o ritmo do vídeo.
+    private readonly Queue<Outgoing> _videoOutbound = new();
+    private readonly Queue<Outgoing> _audioOutbound = new();
     private readonly object _outboundLock = new();
     private readonly ManualResetEventSlim _hasWork = new(false);
     private Thread? _sendThread;
 
-    // Espaço pra uns 15 quadros-chave. Passou disso, a rede não está dando
-    // conta e guardar mais só aumentaria o atraso.
-    private const int MaxQueuedPackets = 1500;
+    // Espaço pra uns 15 quadros-chave de vídeo. Passou disso, a rede não
+    // está dando conta e guardar mais só aumentaria o atraso.
+    private const int MaxQueuedVideoPackets = 1500;
 
-    // Ritmo de saída: rápido o bastante pra não atrasar nada (é ~50x a taxa
-    // de uma transmissão) e espaçado o bastante pra não chegar como rajada.
-    private const double TargetBytesPerSecond = 8 * 1024 * 1024;
+    // Áudio é minúsculo perto de vídeo (bem menos de 1 Mbps mesmo em
+    // qualidade alta) — 200 pacotes já é generoso, e mantém a fila de áudio
+    // sempre curta o bastante pra nunca acumular atraso perceptível.
+    private const int MaxQueuedAudioPackets = 200;
+
+    // Ritmo de saída do VÍDEO: rápido o bastante pra não atrasar nada, mas
+    // espaçado o bastante pra não chegar como rajada capaz de estourar o
+    // link de subida real de quem está em casa (upload doméstico raramente
+    // chega perto disso — o valor antigo, 8 MB/s = 64 Mbps, deixava um
+    // quadro-chave sair todo de uma vez achando que a rede aguentava, e uma
+    // rajada assim é exatamente o que os roteadores no meio do caminho
+    // descartam primeiro). Áudio NÃO usa este ritmo — sai assim que chega,
+    // sem fila de espera na frente.
+    // ATUALIZADO junto com o aumento da taxa de bits do vídeo (ver
+    // VideoEncodeService.BitsPerPixel): este número precisa ficar bem ACIMA do
+    // que o codificador produz, senão ele deixa de ser "espaçar pacotes" e vira
+    // um funil — a fila cresce, o atraso sobe e o vídeo volta a engasgar, mas
+    // desta vez por culpa nossa. Com o codificador indo até 20 Mbps, 5 MB/s
+    // (~42 Mbps) deixa mais que o dobro de folga, e continua muito abaixo de
+    // qualquer link doméstico de subida que aguente transmitir 1080p60.
+    private const double TargetBytesPerSecond = 5 * 1024 * 1024;
 
     public long DroppedFrames { get; private set; }
+
+    // --- Números pro painel de diagnóstico ---------------------------------
+    //
+    // Existem pra responder UMA pergunta objetiva quando a imagem engasga:
+    // o problema nasceu aqui (nós não damos conta de enviar), chegou pela rede
+    // (pacote perdido no caminho), ou é da tela do outro lado? Sem isso, os
+    // três casos parecem idênticos pra quem está assistindo — e cada um pede
+    // uma correção diferente.
+
+    // Quadros que a rede perdeu no caminho até nós: chegou pedaço faltando e
+    // o quadro inteiro teve que ser descartado. É a medida de perda REAL.
+    public long ReassemblyLosses
+    {
+        get
+        {
+            long total = 0;
+            // Só o vídeo: é ele que engasga visivelmente. O áudio tem fila e
+            // remontagem próprias desde a v1.1.9 (ver Peer), e misturar os
+            // dois números aqui esconderia justamente o que se quer enxergar.
+            foreach (var peer in _peers.Values) total += peer.VideoReassembler.DroppedFrames;
+            return total;
+        }
+    }
+
+    // Quanto está represado esperando pra sair. Em rede saudável isso fica
+    // perto de zero o tempo todo; um número que cresce e não volta significa
+    // que estamos produzindo vídeo mais rápido do que a subida aguenta.
+    public int QueuedVideoPackets
+    {
+        get { lock (_outboundLock) return _videoOutbound.Count; }
+    }
+
+    public int QueuedAudioPackets
+    {
+        get { lock (_outboundLock) return _audioOutbound.Count; }
+    }
 
     private void SendLoop()
     {
@@ -286,21 +395,38 @@ public class PeerTransport : IDisposable
 
         while (_running)
         {
-            Outgoing item;
+            Outgoing audioItem = default;
+            Outgoing videoItem = default;
+            bool hasAudio = false, hasVideo = false;
+
             lock (_outboundLock)
             {
-                if (_outbound.Count == 0)
+                if (_audioOutbound.Count > 0)
                 {
-                    _hasWork.Reset();
-                    item = default;
+                    audioItem = _audioOutbound.Dequeue();
+                    hasAudio = true;
+                }
+                else if (_videoOutbound.Count > 0)
+                {
+                    videoItem = _videoOutbound.Dequeue();
+                    hasVideo = true;
                 }
                 else
                 {
-                    item = _outbound.Dequeue();
+                    _hasWork.Reset();
                 }
             }
 
-            if (item.Packet == null)
+            if (hasAudio)
+            {
+                // Sem pacing nenhum: a fila de áudio é sempre curta, e atraso
+                // na voz incomoda muito mais do que uma rajada pequena.
+                try { _socket?.SendTo(audioItem.Packet, audioItem.Target); }
+                catch { /* destino sumiu: a manutenção percebe */ }
+                continue;
+            }
+
+            if (!hasVideo)
             {
                 _hasWork.Wait(100);
                 continue;
@@ -321,10 +447,10 @@ public class PeerTransport : IDisposable
                 nextSendAt = now;      // ficamos parados um tempo: recomeça o ritmo
             }
 
-            try { _socket?.SendTo(item.Packet, item.Target); }
+            try { _socket?.SendTo(videoItem.Packet, videoItem.Target); }
             catch { /* destino sumiu: a manutenção percebe */ }
 
-            nextSendAt += item.Packet.Length * 1000.0 / TargetBytesPerSecond;
+            nextSendAt += videoItem.Packet.Length * 1000.0 / TargetBytesPerSecond;
         }
     }
 
@@ -475,8 +601,16 @@ public class PeerTransport : IDisposable
                 var copy = new byte[length];
                 Buffer.BlockCopy(buffer, 0, copy, 0, length);
 
-                byte[]? frame = peer.Reassembler.Accept(copy, length);
+                bool isVideo = header.Kind == PeerPacket.KindVideo;
+                var reassembler = isVideo ? peer.VideoReassembler : peer.AudioReassembler;
+
+                byte[]? frame = reassembler.Accept(copy, length);
                 if (frame != null) OnFrame?.Invoke(peer.UserId, header.Kind, frame);
+
+                // Perdeu quadro de vídeo? Avisa, pra quem decodifica poder
+                // esperar o próximo quadro-chave em vez de seguir com a
+                // corrente quebrada (ver FrameReassembler.TakeLoss).
+                if (isVideo && reassembler.TakeLoss()) OnVideoLoss?.Invoke(peer.UserId);
                 return;
             }
         }
@@ -618,7 +752,7 @@ public class PeerTransport : IDisposable
         _maintenanceThread = null;
         _sendThread = null;
 
-        lock (_outboundLock) _outbound.Clear();
+        lock (_outboundLock) { _videoOutbound.Clear(); _audioOutbound.Clear(); }
         _peers.Clear();
     }
 

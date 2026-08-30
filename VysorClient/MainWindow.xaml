@@ -532,6 +532,40 @@
                             Background="#2D2D36" Foreground="White"/>
                     <TextBlock x:Name="TxtConnectionResult" Text="" Foreground="#A1A1AA"
                                FontSize="11" TextWrapping="Wrap" Margin="2,8,0,0"/>
+
+                    <!-- Aviso automático no Discord.
+                         Substitui o botão "Entrar" do Discord, que não é
+                         possível (o Discord não transmite o segredo de entrada
+                         de quem não é dono do aplicativo — medido com duas
+                         contas). Aqui a mensagem cai no CANAL, onde todo mundo
+                         vê, em vez de ficar escondida num perfil. -->
+                    <Border Height="1" Background="#27272A" Margin="0,16,0,16"/>
+                    <CheckBox x:Name="ChkDiscordAnnounce" IsChecked="True"
+                              Checked="ChkDiscordAnnounce_Changed" Unchecked="ChkDiscordAnnounce_Changed"
+                              Foreground="White" Content="Avisar o Discord quando eu criar uma sala"/>
+                    <TextBlock Text="Quando você cria uma sala, o Vysor posta o convite no canal do grupo. Não precisa configurar nada."
+                               Foreground="#6B7280" FontSize="11" TextWrapping="Wrap" Margin="24,3,0,6"/>
+
+                    <Button x:Name="BtnConnectDiscord" Content="🔗 Conectar meu Discord"
+                            Click="BtnConnectDiscord_Click" Height="34" Margin="24,2,0,0"
+                            Background="#5865F2" Foreground="White" FontSize="12" FontWeight="Bold"/>
+
+                    <Button x:Name="BtnAddBot" Content="🤖 Instalar o Vysor num servidor (só admins)"
+                            Click="BtnAddBot_Click" Height="34" Margin="24,2,0,0"
+                            Background="#2D2D36" Foreground="White" FontSize="12"/>
+                    <TextBlock x:Name="TxtAddBotHint" Text="Só quem administra o servidor consegue fazer isso."
+                               Foreground="#6B7280" FontSize="11" TextWrapping="Wrap" Margin="24,5,0,0"/>
+
+
+                    <!-- Checagem manual. A automática só roda quando o app
+                         abre (ver CheckForUpdateAsync no code-behind); sem
+                         este botão, a única forma de saber se já saiu uma
+                         versão nova era fechar e abrir o app de novo. -->
+                    <Button x:Name="BtnCheckUpdate" Content="🔄 Verificar atualizações"
+                            Click="BtnCheckUpdate_Click" Height="34" Margin="0,8,0,0"
+                            Background="#2D2D36" Foreground="White"/>
+                    <TextBlock x:Name="TxtUpdateCheckResult" Text="" Foreground="#A1A1AA"
+                               FontSize="11" TextWrapping="Wrap" Margin="2,8,0,0"/>
                 </StackPanel>
             </Grid>
 
@@ -551,13 +585,27 @@
                     </StackPanel>
 
                     <Button Content="🚪 Sair da Sala" Click="BtnLeaveRoom_Click" DockPanel.Dock="Right" Height="30" Padding="12,0" Background="#F23F42" Foreground="White" FontWeight="Bold"/>
+
+                    <!-- Mora na barra de cima, e não no próprio painel, pelo mesmo
+                         motivo do botão de mostrar a prévia: escondido, o painel não
+                         está mais na tela pra ter um botão dentro dele. Aqui em cima
+                         ele está sempre alcançável, nos dois sentidos. -->
+                    <Button x:Name="BtnToggleDiag" Content="📊" ToolTip="Mostrar números de diagnóstico"
+                            Click="BtnToggleDiag_Click" DockPanel.Dock="Right"
+                            Height="30" Padding="10,0" Margin="0,0,8,0"
+                            Background="#2D2D36" Foreground="White"/>
+
+                    <Button x:Name="BtnToggleParticipants" Content="👥 Ocultar participantes"
+                            Click="BtnToggleParticipants_Click" DockPanel.Dock="Right"
+                            Height="30" Padding="12,0" Margin="0,0,8,0"
+                            Background="#2D2D36" Foreground="White"/>
                 </DockPanel>
 
                 <!-- Centro: espaço de transmissões (esquerda/centro) + participantes (direita) -->
                 <Grid Grid.Row="1">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="200"/>
+                        <ColumnDefinition x:Name="ParticipantsColumn" Width="200"/>
                     </Grid.ColumnDefinitions>
 
                     <Border Grid.Column="0" Background="#141419" CornerRadius="10">
@@ -653,6 +701,21 @@
                                     </ItemsControl.ItemTemplate>
                                 </ItemsControl>
 
+                                <!-- Painel de diagnóstico. Desligado por padrão; some
+                                     por completo quando não está ligado, e nunca
+                                     rouba clique do vídeo (IsHitTestVisible="False"). -->
+                                <Border x:Name="DiagPanel" Visibility="Collapsed"
+                                        HorizontalAlignment="Left" VerticalAlignment="Top"
+                                        Margin="12" Padding="12,10" CornerRadius="8"
+                                        Background="#D8000000" IsHitTestVisible="False">
+                                    <StackPanel>
+                                        <TextBlock Text="DIAGNÓSTICO" Foreground="#6B7280"
+                                                   FontSize="10" FontWeight="Bold" Margin="0,0,0,6"/>
+                                        <TextBlock x:Name="TxtDiag" Foreground="#D1D5DB"
+                                                   FontFamily="Consolas" FontSize="12" LineHeight="18"/>
+                                    </StackPanel>
+                                </Border>
+
                                 <StackPanel x:Name="EmptyStatePanel" HorizontalAlignment="Center" VerticalAlignment="Center">
                                     <TextBlock x:Name="StreamPlaceholderText" Text="Aguardando transmissão de tela..." Foreground="#6B7280" FontSize="14" HorizontalAlignment="Center"/>
                                     <TextBlock Text="Clique no play ao lado de um participante pra assistir (você pode ver vários ao mesmo tempo)" Foreground="#4B5563" FontSize="11" HorizontalAlignment="Center" Margin="0,6,0,0" TextWrapping="Wrap" MaxWidth="260" TextAlignment="Center"/>
@@ -671,17 +734,33 @@
                                                Foreground="#FAA61A" FontSize="12" TextWrapping="Wrap"
                                                TextAlignment="Center" Margin="20,0,20,10"/>
 
-                                    <Button x:Name="BtnShareScreen" Content="🖥️ TRANSMITIR" Click="BtnShareScreen_Click"
-                                        HorizontalAlignment="Center"
-                                        Height="42" MinWidth="200" Padding="20,0"
-                                        Background="#5865F2" Foreground="White" FontWeight="Bold" FontSize="14"/>
+                                    <!-- Os dois botões lado a lado. O "TRANSMITIR" continua
+                                         exatamente como era; o de ocultar aparece só enquanto
+                                         você está transmitindo, porque só aí existe uma prévia
+                                         sua pra esconder.
+
+                                         O botão de VOLTAR a mostrar precisa morar AQUI FORA, e
+                                         não dentro da telinha: escondida, ela não existe mais na
+                                         tela, e um botão dentro dela seria inalcançável. Um botão
+                                         só, que alterna nos dois sentidos, não tem esse buraco. -->
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                        <Button x:Name="BtnShareScreen" Content="🖥️ TRANSMITIR" Click="BtnShareScreen_Click"
+                                            HorizontalAlignment="Center"
+                                            Height="42" MinWidth="200" Padding="20,0"
+                                            Background="#5865F2" Foreground="White" FontWeight="Bold" FontSize="14"/>
+
+                                        <Button x:Name="BtnToggleLocalTile" Content="🙈 Ocultar minha tela"
+                                            Click="BtnToggleLocalTile_Click" Visibility="Collapsed"
+                                            Margin="10,0,0,0" Height="42" Padding="16,0"
+                                            Background="#2D2D36" Foreground="White" FontSize="13"/>
+                                    </StackPanel>
                                 </StackPanel>
                             </Border>
                         </Grid>
                     </Border>
 
                     <!-- Painel Lateral de Participantes -->
-                    <Border Grid.Column="1" Background="#1E1E24" CornerRadius="10" Margin="10,0,0,0" Padding="8">
+                    <Border x:Name="ParticipantsPanel" Grid.Column="1" Background="#1E1E24" CornerRadius="10" Margin="10,0,0,0" Padding="8">
                         <DockPanel>
                             <TextBlock DockPanel.Dock="Top" Text="PARTICIPANTES" Foreground="#6B7280" FontSize="11" FontWeight="Bold" Margin="4,4,4,8"/>
                             <ScrollViewer VerticalScrollBarVisibility="Auto">
@@ -750,6 +829,17 @@
                                        VerticalAlignment="Center"/>
                             <Button DockPanel.Dock="Right" Content="✕" Click="BtnCloseShareModal_Click"
                                     Style="{StaticResource CloseModalButtonStyle}"/>
+
+                            <!-- A lista era montada UMA vez, ao abrir o modal. Um jogo
+                                 que sobe depois (ou que ainda não tinha título quando a
+                                 lista foi feita) só aparecia se a pessoa fechasse e
+                                 abrisse tudo de novo — que foi como um usuário
+                                 descobriu o problema sozinho. -->
+                            <Button x:Name="BtnRefreshSources" DockPanel.Dock="Right"
+                                    Content="🔄 Atualizar lista" Click="BtnRefreshSources_Click"
+                                    Height="30" Padding="12,0" Margin="0,0,10,0"
+                                    Background="#2D2D36" Foreground="White" FontSize="12"
+                                    VerticalAlignment="Center"/>
                         </DockPanel>
 
                         <TabControl Grid.Row="1" SelectionChanged="TabControl_SelectionChanged" Background="Transparent" BorderThickness="0">
@@ -819,6 +909,19 @@
             <TextBlock Text="⚡ Vysor" Foreground="White" FontSize="18" FontWeight="Bold"
                        HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16,7,0,0"
                        IsHitTestVisible="False"/>
+
+            <!-- Some sozinho quando não há atualização (o normal). Fica
+                 flutuando no canto inferior direito, longe do logo e dos
+                 botões de janela, pra nunca sobrepor nada. Ver
+                 UpdateChecker.cs / CheckForUpdateAsync no code-behind. -->
+            <Border x:Name="UpdateBanner" Grid.RowSpan="2" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                    Margin="0,0,16,16" Background="#F0B132" CornerRadius="6"
+                    Visibility="Collapsed">
+                <Button x:Name="BtnUpdate" Click="BtnUpdate_Click" Height="30" Padding="12,0"
+                        Background="Transparent" BorderThickness="0" Foreground="#18181B"
+                        FontWeight="Bold" FontSize="12"
+                        Content="⬆ Atualização disponível — clique pra instalar"/>
+            </Border>
         </Grid>
     </Grid>
 </Window>

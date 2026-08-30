@@ -478,4 +478,27 @@ public class SignalRService
         }
         catch { }
     }
+
+    // Pede pro servidor avisar o canal do Discord. Devolve false quando ele
+    // não fez nada — porque o bot não está configurado, porque o servidor é
+    // antigo, ou porque a sala está hospedada no PC de alguém.
+    //
+    // Esse false é o que faz o app cair sozinho no caminho anterior (webhook),
+    // sem ninguém precisar mexer em nada. É o "jeito de voltar": apagar as
+    // variáveis do bot no servidor devolve o comportamento antigo pra todo
+    // mundo, na hora, sem publicar versão nova.
+    public async Task<bool> AnnounceRoomOnDiscordAsync(string displayName, string? channelId)
+    {
+        try
+        {
+            if (_connection != null && IsConnected)
+                return await _connection.InvokeAsync<bool>("AnnounceRoomOnDiscord", displayName, channelId ?? string.Empty);
+        }
+        catch
+        {
+            // Servidor sem esse método (versão antiga): trata como "não
+            // anunciou" pra que o caminho antigo assuma.
+        }
+        return false;
+    }
 }

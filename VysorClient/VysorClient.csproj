@@ -10,6 +10,10 @@
     <AssemblyName>Vysor</AssemblyName>
     <Product>Vysor</Product>
     <AssemblyTitle>Vysor</AssemblyTitle>
+    <!-- Fonte da verdade da versão. Ao publicar uma atualização, suba este
+         número, use o MESMO em installer/Vysor.iss (MyAppVersion) e crie uma
+         tag "vX.Y.Z" no GitHub com esse número (ver UpdateChecker.cs). -->
+    <Version>1.7.1</Version>
     <UseWindowsForms>true</UseWindowsForms>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
 
@@ -48,6 +52,9 @@
     <Compile Include="..\VysorServer\Hubs\RoomHub.cs" Link="Servidor\RoomHub.cs" />
     <Compile Include="..\VysorServer\RoomManager.cs" Link="Servidor\RoomManager.cs" />
     <Compile Include="..\VysorServer\RoomSweeper.cs" Link="Servidor\RoomSweeper.cs" />
+    <!-- Vem junto porque o RoomHub depende dele. No cliente ele nunca tem
+         token e por isso nunca anuncia nada (ver LocalServer.ConfigureServices). -->
+    <Compile Include="..\VysorServer\DiscordAnnouncer.cs" Link="Servidor\DiscordAnnouncer.cs" />
   </ItemGroup>
 
   <ItemGroup>
