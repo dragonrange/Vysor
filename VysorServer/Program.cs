@@ -167,6 +167,92 @@ app.MapGet("/discord/estado", async (HttpContext ctx, DiscordAnnouncer discord) 
     Results.Text(await discord.CheckAsync(ctx.Request.Query["canal"].ToString()),
                  "text/plain; charset=utf-8"));
 
+// ---- "Em qual dos MEUS servidores o Vysor está?" ----
+//
+// O QUE ISTO RESOLVE
+// Antes, avisar no Discord dependia de alguém ESCOLHER um canal — e só admins
+// conseguem. Um membro comum ficava sem aviso, mesmo estando no mesmo grupo,
+// com o bot instalado ali do lado.
+//
+// Aqui a pessoa entra com a conta do Discord dela (uma vez) e o Vysor descobre
+// sozinho: cruza os servidores dela com os servidores onde o bot está. Achou um
+// só, pronto — nem escolha de canal, nem ser admin, nem digitar nada.
+//
+// O CRUZAMENTO ACONTECE NO NAVEGADOR DELA, de propósito. A lista de servidores
+// do bot é pedida pra cá, a lista dela vem direto do Discord, e as duas se
+// encontram na máquina dela. Este servidor nunca vê de quais servidores a
+// pessoa participa — o que é a diferença entre "descobrir onde avisar" e
+// "coletar o perfil social de alguém".
+app.MapGet("/discord/servidores-do-bot", async (DiscordAnnouncer discord) =>
+    Results.Json(await discord.BotGuildIdsAsync()));
+
+app.MapGet("/discord/canal-principal/{guildId}", async (string guildId, DiscordAnnouncer discord) =>
+{
+    // Só responde por servidores onde o bot REALMENTE está: sem isso, este
+    // endereço viraria uma forma de qualquer um perguntar o nome de canais de
+    // servidores alheios.
+    var allowed = await discord.BotGuildIdsAsync();
+    if (!allowed.Contains(guildId)) return Results.NotFound();
+
+    var channel = await discord.MainChannelOfAsync(guildId);
+    return channel == null
+        ? Results.NotFound()
+        : Results.Json(new { id = channel.Value.Id, name = channel.Value.Name });
+});
+
+app.MapGet("/discord/conectar", () => Results.Content(LegalPages.Shell("Conectar o Discord — Vysor", """
+  <h2 id="t">Procurando seus servidores…</h2>
+  <p id="m">Um instante.</p>
+  <div class="list" id="l"></div>
+  <script>
+  (async () => {
+    const t = document.getElementById('t'), m = document.getElementById('m'), l = document.getElementById('l');
+    const say = (title, msg) => { t.textContent = title; m.innerHTML = msg; };
+
+    // O Discord devolve a chave depois do "#", que NUNCA e enviado a servidor
+    // nenhum pelo navegador. Ela existe so aqui, nesta aba, por segundos.
+    const token = new URLSearchParams(location.hash.slice(1)).get('access_token');
+    if (!token) return say('Nao consegui entrar',
+      'O Discord nao devolveu a autorizacao. Volte ao Vysor e tente de novo.');
+
+    try {
+      const meus = await (await fetch('https://discord.com/api/v10/users/@me/guilds',
+        { headers: { Authorization: 'Bearer ' + token } })).json();
+      const doBot = await (await fetch('/discord/servidores-do-bot')).json();
+
+      const set = new Set(doBot);
+      const iguais = meus.filter(g => set.has(g.id));
+
+      if (iguais.length === 0) return say('Nenhum dos seus servidores tem o Vysor',
+        'Peca a quem administra o servidor para instalar o Vysor nele. ' +
+        'Depois e so voltar aqui: vai funcionar sozinho, sem voce configurar nada.');
+
+      for (const g of iguais) {
+        const r = await fetch('/discord/canal-principal/' + g.id);
+        if (!r.ok) continue;
+        const c = await r.json();
+        const a = document.createElement('a');
+        a.className = 'ch';
+        a.href = 'vysor://canal/' + c.id + '/' + btoa(unescape(encodeURIComponent(c.name)))
+                   .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+        a.textContent = g.name + '  ->  #' + c.name;
+        l.appendChild(a);
+      }
+
+      if (!l.children.length) return say('Achei o servidor, mas nao o canal',
+        'Confira se o Vysor tem permissao de <b>Ver canais</b> nesse servidor.');
+
+      say(iguais.length === 1 ? 'Achei!' : 'Achei mais de um',
+        iguais.length === 1
+          ? 'Clique abaixo para confirmar e voltar ao Vysor.'
+          : 'Escolha em qual servidor voce quer que os convites aparecam.');
+    } catch (e) {
+      say('Deu problema', 'Nao consegui falar com o Discord agora. Tente de novo em instantes.');
+    }
+  })();
+  </script>
+"""), "text/html; charset=utf-8"));
+
 // ---- Depois de instalar o Vysor num servidor do Discord ----
 //
 // O Discord manda a pessoa pra cá assim que ela autoriza, com o identificador

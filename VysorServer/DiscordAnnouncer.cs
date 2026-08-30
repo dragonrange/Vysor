@@ -209,6 +209,89 @@ public class DiscordAnnouncer
         }
     }
 
+    // Em quais servidores o Vysor está instalado. Guardado por pouco tempo:
+    // muda só quando alguém instala ou remove o bot, mas quando muda a gente
+    // precisa perceber sem esperar o servidor reiniciar.
+    private HashSet<string>? _botGuilds;
+    private DateTime _botGuildsAt = DateTime.MinValue;
+
+    public async Task<HashSet<string>> BotGuildIdsAsync()
+    {
+        if (_botGuilds != null && DateTime.UtcNow - _botGuildsAt < TimeSpan.FromMinutes(2))
+            return _botGuilds;
+
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(_token)) return ids;
+
+        try
+        {
+            var response = await _http.GetAsync("https://discord.com/api/v10/users/@me/guilds");
+            if (response.IsSuccessStatusCode)
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(
+                    await response.Content.ReadAsStringAsync());
+
+                foreach (var g in doc.RootElement.EnumerateArray())
+                    if (g.TryGetProperty("id", out var id))
+                        ids.Add(id.GetString() ?? "");
+
+                _botGuilds = ids;
+                _botGuildsAt = DateTime.UtcNow;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Falha ao listar os servidores do bot");
+        }
+
+        return ids;
+    }
+
+    // O "chat principal" de um servidor: o canal de sistema (onde o Discord põe
+    // os avisos de quem entrou) ou, na falta dele, o primeiro canal de texto.
+    public async Task<(string Id, string Name)?> MainChannelOfAsync(string guildId)
+    {
+        guildId = Clean(guildId, 25);
+        if (guildId.Length == 0 || !guildId.All(char.IsDigit)) return null;
+        if (string.IsNullOrWhiteSpace(_token)) return null;
+
+        try
+        {
+            var response = await _http.GetAsync($"https://discord.com/api/v10/guilds/{guildId}");
+            if (response.IsSuccessStatusCode)
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(
+                    await response.Content.ReadAsStringAsync());
+
+                if (doc.RootElement.TryGetProperty("system_channel_id", out var sys) &&
+                    sys.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    string? id = sys.GetString();
+                    if (!string.IsNullOrWhiteSpace(id))
+                    {
+                        var one = await _http.GetAsync($"https://discord.com/api/v10/channels/{id}");
+                        if (one.IsSuccessStatusCode)
+                        {
+                            using var cd = System.Text.Json.JsonDocument.Parse(
+                                await one.Content.ReadAsStringAsync());
+                            return (id!, cd.RootElement.TryGetProperty("name", out var n)
+                                ? n.GetString() ?? "canal" : "canal");
+                        }
+                    }
+                }
+            }
+
+            var list = await ListTextChannelsAsync(guildId);
+            if (list.Channels.Count > 0) return list.Channels[0];
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Falha ao achar o canal principal de {Guild}", guildId);
+        }
+
+        return null;
+    }
+
     // Anuncia num canal ESCOLHIDO por quem criou a sala. É o que permite cada
     // pessoa avisar o servidor dela, em vez de existir um único canal fixo pro
     // mundo inteiro.
