@@ -76,6 +76,67 @@ app.MapGet("/room/{code}", (string code, RoomManager rooms) =>
         ? Results.Ok("existe")
         : Results.NotFound());
 
+// ---- Convite clicável: /j/CODIGO ----
+//
+// POR QUE ISTO PRECISA EXISTIR NO SERVIDOR
+// O app entende "vysor://T2X9RF" e entra na sala sozinho. Só que o Discord
+// (como quase todo lugar) NÃO transforma um endereço desses em link clicável —
+// ele sai como texto morto na mensagem. E botão também não resolve: botão de
+// link no Discord só aceita http/https.
+//
+// Então o convite precisa ser um endereço https de verdade. Esta página é a
+// ponte: ela recebe o clique, manda o navegador abrir "vysor://CODIGO" e o
+// Windows entrega pro Vysor. Uma linha de HTML resolve o que nenhuma
+// configuração do Discord resolveria.
+//
+// De quebra, ela atende quem AINDA NÃO TEM o Vysor — antes essa pessoa
+// recebia um texto que não fazia nada. Agora ela cai numa página que explica
+// o que é e oferece o download.
+app.MapGet("/j/{code}", (string code) =>
+{
+    // Só letras e números, e curto. O que vem daqui é escrito dentro de uma
+    // página HTML: aceitar qualquer coisa seria deixar alguém montar um link
+    // que injeta script na página (e o link viajaria com a nossa cara).
+    string clean = new string((code ?? string.Empty)
+        .Where(char.IsLetterOrDigit).Take(12).ToArray()).ToUpperInvariant();
+
+    if (clean.Length == 0) return Results.NotFound();
+
+    string html = $$"""
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Entrar na sala {{clean}} — Vysor</title>
+<style>
+ body{background:#0d0d10;color:#e5e7eb;font-family:Segoe UI,system-ui,sans-serif;
+      display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}
+ .box{padding:32px;max-width:420px}
+ .code{font-size:34px;font-weight:700;letter-spacing:3px;color:#5865f2;margin:14px 0}
+ a.btn{display:inline-block;background:#5865f2;color:#fff;text-decoration:none;
+       padding:13px 26px;border-radius:8px;font-weight:700;margin-top:8px}
+ p{color:#9ca3af;line-height:1.5}
+ .small{font-size:13px;margin-top:26px}
+ .small a{color:#8b93f8}
+</style></head>
+<body><div class="box">
+ <h2>Abrindo o Vysor…</h2>
+ <p>Se nada acontecer, use o botão. O código da sala é:</p>
+ <div class="code">{{clean}}</div>
+ <a class="btn" href="vysor://{{clean}}">Entrar na sala</a>
+ <p class="small">Ainda não tem o Vysor?
+   <a href="https://github.com/dragonrange/Vysor/releases/latest">Baixe aqui</a>.</p>
+</div>
+<script>
+ // Tenta abrir sozinho. Se o Vysor não estiver instalado, o navegador
+ // simplesmente ignora e a pessoa fica na página, com o botão e o código.
+ location.href = "vysor://{{clean}}";
+</script>
+</body></html>
+""";
+
+    return Results.Content(html, "text/html; charset=utf-8");
+});
+
 // Aqui é onde os clientes (o app Vysor dos seus amigos) vão se conectar.
 app.MapHub<RoomHub>("/roomhub", options =>
 {
