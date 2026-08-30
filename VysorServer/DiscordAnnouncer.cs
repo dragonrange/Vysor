@@ -70,13 +70,30 @@ public class DiscordAnnouncer
     // Lista os canais de texto de um servidor, pra pessoa poder CLICAR num em
     // vez de descobrir e digitar um número de canal (o que exigiria ligar o
     // "modo desenvolvedor" do Discord — passo em que quase todo mundo desiste).
-    public async Task<List<(string Id, string Name)>> ListTextChannelsAsync(string? guildId)
+    // Devolve TAMBÉM o motivo quando dá errado.
+    //
+    // A primeira versão só devolvia a lista, e uma lista vazia podia significar
+    // quatro coisas completamente diferentes: falta o token no servidor, o
+    // Discord não informou qual servidor, a chamada foi recusada, ou o bot
+    // realmente não vê canal nenhum. Cada uma pede uma correção diferente — e a
+    // página mostrava a mesma frase pras quatro. Foi exatamente esse tipo de
+    // "falha sem pista" que já custou uma rodada de adivinhação neste projeto.
+    public sealed record ChannelList(List<(string Id, string Name)> Channels, string? Problem);
+
+    public async Task<ChannelList> ListTextChannelsAsync(string? guildId)
     {
         var result = new List<(string, string)>();
 
-        if (string.IsNullOrWhiteSpace(_token)) return result;
+        if (string.IsNullOrWhiteSpace(_token))
+            return new ChannelList(result,
+                "O servidor do Vysor ainda não recebeu o token do bot. " +
+                "Falta definir a variável DISCORD_BOT_TOKEN no painel do Render.");
+
         guildId = Clean(guildId, 25);
-        if (guildId.Length == 0 || !guildId.All(char.IsDigit)) return result;
+        if (guildId.Length == 0 || !guildId.All(char.IsDigit))
+            return new ChannelList(result,
+                "O Discord não informou qual servidor foi escolhido. " +
+                "Volte ao Vysor e clique em adicionar novamente.");
 
         try
         {
@@ -84,7 +101,17 @@ public class DiscordAnnouncer
             if (!response.IsSuccessStatusCode)
             {
                 _log.LogWarning("Discord recusou listar canais: {Status}", response.StatusCode);
-                return result;
+
+                string detail = (int)response.StatusCode switch
+                {
+                    401 => "o token do bot está inválido ou foi regerado — atualize DISCORD_BOT_TOKEN no Render",
+                    403 => "o bot não tem permissão de Ver canais neste servidor",
+                    404 => "o bot não está neste servidor (a instalação não chegou a concluir)",
+                    429 => "o Discord pediu pra esperar um pouco; tente de novo em instantes",
+                    _   => $"o Discord respondeu {(int)response.StatusCode}"
+                };
+
+                return new ChannelList(result, $"Não consegui listar os canais: {detail}.");
             }
 
             using var doc = System.Text.Json.JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -103,9 +130,13 @@ public class DiscordAnnouncer
         catch (Exception ex)
         {
             _log.LogWarning(ex, "Falha ao listar canais");
+            return new ChannelList(result, $"Erro ao falar com o Discord: {ex.GetType().Name}.");
         }
 
-        return result;
+        return new ChannelList(result, result.Count > 0
+            ? null
+            : "O bot está no servidor, mas não enxerga nenhum canal de texto. " +
+              "Confira se o cargo Vysor tem a permissão Ver canais.");
     }
 
     // Anuncia num canal ESCOLHIDO por quem criou a sala. É o que permite cada

@@ -168,22 +168,30 @@ app.MapGet("/privacidade", () => Results.Content(LegalPages.Privacy, "text/html;
 app.MapGet("/discord/instalado", async (HttpContext ctx, DiscordAnnouncer discord) =>
 {
     string guildId = ctx.Request.Query["guild_id"].ToString();
-    var channels = await discord.ListTextChannelsAsync(guildId);
+    var result = await discord.ListTextChannelsAsync(guildId);
 
     string body;
-    if (channels.Count == 0)
+    if (result.Channels.Count == 0)
     {
-        body = """
+        // Diz O QUE deu errado, não só que deu. Ver o comentário em
+        // DiscordAnnouncer.ListTextChannelsAsync: uma lista vazia tinha quatro
+        // causas possíveis, cada uma com uma correção diferente, e mostrar a
+        // mesma frase pras quatro obrigava a adivinhar.
+        string problem = System.Net.WebUtility.HtmlEncode(
+            result.Problem ?? "Não consegui ver os canais deste servidor.");
+
+        body = $"""
           <h2>Quase lá</h2>
-          <p>O Vysor foi adicionado, mas não consegui ver os canais deste servidor.
-             Confira se ele tem permissão de <b>Ver canais</b> e
-             <b>Enviar mensagens</b>, e abra este endereço de novo.</p>
+          <p>O Vysor foi adicionado ao servidor, mas ainda falta uma coisa:</p>
+          <p style="color:#faa61a">{problem}</p>
+          <p class="small">Resolvido isso, é só abrir este endereço de novo
+             (ou clicar em adicionar outra vez, no Vysor).</p>
         """;
     }
     else
     {
         var list = new System.Text.StringBuilder();
-        foreach (var (id, name) in channels)
+        foreach (var (id, name) in result.Channels)
         {
             // Nome em base64url: nome de canal aceita caracteres que
             // estragariam o formato do link de volta.
