@@ -13,7 +13,7 @@
     <!-- Fonte da verdade da versão. Ao publicar uma atualização, suba este
          número, use o MESMO em installer/Vysor.iss (MyAppVersion) e crie uma
          tag "vX.Y.Z" no GitHub com esse número (ver UpdateChecker.cs). -->
-    <Version>1.7.1</Version>
+    <Version>1.7.2</Version>
     <UseWindowsForms>true</UseWindowsForms>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
 

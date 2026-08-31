@@ -835,6 +835,12 @@
                                  lista foi feita) só aparecia se a pessoa fechasse e
                                  abrisse tudo de novo — que foi como um usuário
                                  descobriu o problema sozinho. -->
+                            <Button x:Name="BtnWhyMissing" DockPanel.Dock="Right"
+                                    Content="Não achou sua janela?" Click="BtnWhyMissing_Click"
+                                    Height="30" Padding="12,0" Margin="0,0,10,0"
+                                    Background="Transparent" Foreground="#8B93F8" FontSize="12"
+                                    BorderThickness="0" Cursor="Hand" VerticalAlignment="Center"/>
+
                             <Button x:Name="BtnRefreshSources" DockPanel.Dock="Right"
                                     Content="🔄 Atualizar lista" Click="BtnRefreshSources_Click"
                                     Height="30" Padding="12,0" Margin="0,0,10,0"

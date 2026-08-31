@@ -2957,34 +2957,51 @@ public partial class MainWindow : Window
     {
         List<WindowHandle> windows = new();
         uint myProcessId = (uint)Environment.ProcessId;
+        _windowRejections.Clear();
 
         EnumWindows((hWnd, lParam) =>
         {
             try
             {
-                if (!IsWindowVisible(hWnd)) return true;
+                // Cada descarte é ANOTADO com o motivo (ver _windowRejections).
+                // Duas tentativas de adivinhar por que um jogo não aparecia na
+                // lista falharam, e adivinhar de novo custaria mais uma rodada.
+                // Com o motivo escrito, o próximo relato já vem com a resposta.
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                string quem = ProcessNameOf(pid);
+
+                void Reject(string motivo)
+                {
+                    if (quem.Length > 0 && _windowRejections.Count < 60)
+                        _windowRejections.Add($"{quem} — {motivo}");
+                }
+
+                if (!IsWindowVisible(hWnd)) { Reject("marcada como não visível"); return true; }
 
                 // Só janelas de verdade, de primeiro nível — nada de janelinhas
                 // auxiliares que pertencem a outra.
-                if (GetAncestor(hWnd, GA_ROOT) != hWnd) return true;
+                if (GetAncestor(hWnd, GA_ROOT) != hWnd) { Reject("é janela filha de outra"); return true; }
 
                 // Janelas "de ferramenta" (barras flutuantes, elementos internos
                 // de programas) não são coisas que alguém escolheria transmitir.
                 long exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE).ToInt64();
-                if ((exStyle & WS_EX_TOOLWINDOW) != 0) return true;
+                if ((exStyle & WS_EX_TOOLWINDOW) != 0) { Reject("é janela de ferramenta"); return true; }
 
                 // ESTE é o filtro que resolve as janelas fantasma.
-                if (IsCloaked(hWnd)) return true;
+                if (IsCloaked(hWnd)) { Reject("encoberta (app pré-carregado em segundo plano)"); return true; }
 
                 // Ignora as nossas próprias janelas (não faz sentido transmitir
                 // o Vysor de dentro do Vysor).
-                GetWindowThreadProcessId(hWnd, out uint pid);
                 if (pid == myProcessId) return true;
 
                 // Descarta tamanhos absurdos (janelas de serviço costumam ser
                 // 0x0 ou 1x1).
-                if (!GetWindowRect(hWnd, out RECT rect)) return true;
-                if (rect.Right - rect.Left < 80 || rect.Bottom - rect.Top < 80) return true;
+                if (!GetWindowRect(hWnd, out RECT rect)) { Reject("sem tamanho consultável"); return true; }
+                if (rect.Right - rect.Left < 80 || rect.Bottom - rect.Top < 80)
+                {
+                    Reject($"pequena demais ({rect.Right - rect.Left}x{rect.Bottom - rect.Top})");
+                    return true;
+                }
 
                 int length = GetWindowTextLength(hWnd);
                 string title = "";
@@ -3008,20 +3025,89 @@ public partial class MainWindow : Window
                 // escrito "deadlock" é infinitamente melhor que item nenhum.
                 if (title.Length == 0)
                 {
-                    title = ProcessNameOf(pid);
-                    if (title.Length == 0) return true;   // nem isso: aí sim desiste
+                    title = quem;
+                    if (title.Length == 0)
+                    {
+                        // Nem título nem nome de programa: quase sempre é uma
+                        // janela de privilégio maior que o nosso (jogo aberto
+                        // como administrador). O Windows bloqueia a consulta, e
+                        // a saída é abrir o Vysor também como administrador.
+                        _windowRejections.Add("(desconhecida) — sem título e sem nome de programa acessível; " +
+                                              "provavelmente roda como administrador");
+                        return true;
+                    }
                 }
 
                 windows.Add(new WindowHandle { Title = title, hWnd = hWnd });
             }
-            catch
+            catch (Exception ex)
             {
-                // Uma janela problemática nunca pode derrubar a listagem toda.
+                // Uma janela problemática nunca pode derrubar a listagem toda —
+                // mas some do relatório se ninguém anotar.
+                if (_windowRejections.Count < 60)
+                    _windowRejections.Add($"(erro) — {ex.GetType().Name}");
             }
             return true;
         }, 0);
 
         return windows;
+    }
+
+    // Janelas que foram examinadas e descartadas, com o motivo de cada uma.
+    // Preenchido a cada varredura e mostrado sob demanda (ver
+    // BtnWhyMissing_Click).
+    private readonly List<string> _windowRejections = new();
+
+    private void BtnWhyMissing_Click(object sender, RoutedEventArgs e)
+    {
+        bool elevated = IsRunningElevated();
+
+        var texto = new StringBuilder();
+        texto.AppendLine($"O Vysor está aberto {(elevated ? "COMO ADMINISTRADOR" : "de forma comum")}.");
+        texto.AppendLine();
+
+        if (!elevated)
+        {
+            texto.AppendLine("Se a janela que falta é de um JOGO, este costuma ser o motivo:");
+            texto.AppendLine("quando o jogo roda como administrador, o Windows impede que um");
+            texto.AppendLine("programa comum leia a janela dele.");
+            texto.AppendLine();
+            texto.AppendLine("Teste: feche o Vysor, clique com o botão direito no ícone dele e");
+            texto.AppendLine("escolha \"Executar como administrador\".");
+            texto.AppendLine();
+        }
+
+        texto.AppendLine($"Janelas listadas: {_windowSources.Count}");
+        texto.AppendLine($"Janelas descartadas: {_windowRejections.Count}");
+
+        if (_windowRejections.Count > 0)
+        {
+            texto.AppendLine();
+            texto.AppendLine("Descartadas, e por quê:");
+            foreach (string linha in _windowRejections.Distinct().Take(40))
+                texto.AppendLine("  • " + linha);
+        }
+
+        try { Clipboard.SetText(texto.ToString()); } catch { }
+
+        System.Windows.MessageBox.Show(
+            texto + "\n(Este texto foi copiado — dá pra colar e mandar pra quem for ajudar.)",
+            "Por que minha janela não aparece?",
+            MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private static bool IsRunningElevated()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            return new System.Security.Principal.WindowsPrincipal(identity)
+                .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // Pergunta ao gerenciador de janelas do Windows se a janela está
